@@ -1,0 +1,15 @@
+# Local development environment only. This file is NEVER read by the
+# validator and is NEVER included in the submission zip (see
+# tools/build_zip.py's explicit whitelist) — the competition runtime
+# already provides the exact packages below, pre-installed, and installs
+# nothing else at validation time.
+#
+# Pinned to match the competition runtime so local testing is representative.
+torch==2.13.0
+numpy==2.5.2
+chess==1.11.2
+onnxruntime==1.29.0
+numba==0.67.0
+
+# Harness/test tooling (dev-only, not part of the runtime constraint).
+pytest>=8.0
