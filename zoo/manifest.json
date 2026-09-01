@@ -1,0 +1,45 @@
+{
+  "versions": {
+    "v1-alphabeta": {
+      "created_at": "2026-08-31T23:10:37+00:00",
+      "files": [
+        "agent.py",
+        "cb_engine.py",
+        "cb_eval.py",
+        "cb_order.py",
+        "cb_search.py",
+        "cb_tables.py",
+        "cb_time.py"
+      ],
+      "notes": "days 1-2: negamax+ab+qsearch on python-chess"
+    },
+    "v2-tt-ordering": {
+      "created_at": "2026-09-01T09:49:34+00:00",
+      "files": [
+        "agent.py",
+        "cb_engine.py",
+        "cb_eval.py",
+        "cb_order.py",
+        "cb_search.py",
+        "cb_tables.py",
+        "cb_time.py",
+        "cb_tt.py"
+      ],
+      "notes": "TT + PVS + killers + history + MVV-LVA; qsearch movegen + eval-phase-merge profiling fixes"
+    },
+    "v3-nullmove-lmr": {
+      "created_at": "2026-09-01T09:53:06+00:00",
+      "files": [
+        "agent.py",
+        "cb_engine.py",
+        "cb_eval.py",
+        "cb_order.py",
+        "cb_search.py",
+        "cb_tables.py",
+        "cb_time.py",
+        "cb_tt.py"
+      ],
+      "notes": "null-move pruning (R=2) + LMR (reduce after move 4, depth>=3) on top of v2's TT/PVS/killers/history"
+    }
+  }
+}

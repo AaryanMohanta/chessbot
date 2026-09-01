@@ -5,3 +5,19 @@ dist/
 *.egg-info/
 .venv/
 venv/
+
+# Regenerable report artifact; games.csv and zoo/ ARE tracked on purpose
+# (games.csv is the ratings source of truth, zoo/ preserves every frozen
+# version) but this plot is just derived from them.
+ratings/ladder.png
+
+# Local-only calibration opponent (~150MB with source). Third-party
+# engines are banned from the submission zip, not from local testing, but
+# this is a downloaded binary that doesn't belong in version control
+# either way — each dev fetches their own via tools/setup_stockfish.md.
+tools/stockfish/
+
+# Ad-hoc run logs from manual calibration/SPRT sessions — ephemeral
+# diagnostic output, not infrastructure. games.csv (the real record of
+# every game played) and zoo/ are tracked; these raw logs are not.
+ratings/calibration_logs/

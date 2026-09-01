@@ -32,9 +32,10 @@ class AgentProcess:
     timed out cross-platform (no reliance on POSIX-only select() on pipes).
     """
 
-    def __init__(self, agent_path: str, name: str):
+    def __init__(self, agent_path: str, name: str, env: dict | None = None):
         self.name = name
         self.agent_path = agent_path
+        proc_env = {**os.environ, **env} if env else None
         self.proc = subprocess.Popen(
             [sys.executable, _STDIO_RUNNER, agent_path],
             stdin=subprocess.PIPE,
@@ -42,6 +43,7 @@ class AgentProcess:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=proc_env,
         )
         self.init_ms: float | None = None
         self._queue: "queue.Queue[str]" = queue.Queue()
@@ -120,8 +122,21 @@ class AgentProcess:
         return data
 
     def close(self) -> None:
+        """Close stdin (EOF) and give the process a chance to exit on its
+        own before escalating to terminate/kill. This matters beyond tidy
+        shutdown: a well-behaved agent (ours, or a wrapper around a nested
+        subprocess like the Stockfish calibration opponent) runs its own
+        cleanup — e.g. telling a child engine process to quit — when its
+        stdin loop ends naturally. TerminateProcess on Windows (what
+        subprocess.terminate() does) skips all of that and would orphan
+        any subprocess the agent itself spawned."""
         try:
             self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+            return
         except Exception:
             pass
         try:
@@ -141,6 +156,7 @@ class GameResult:
     plies: int
     white_times_ms: list
     black_times_ms: list
+    moves_uci: list = dataclasses.field(default_factory=list)
 
 
 def _opponent(side: str) -> str:
@@ -153,18 +169,29 @@ def play_game(
     time_ms: float = DEFAULT_TIME_MS,
     increment_ms: float = DEFAULT_INCREMENT_MS,
     max_fullmoves: int = MAX_FULLMOVES,
+    start_fen: str | None = None,
+    white_env: dict | None = None,
+    black_env: dict | None = None,
 ) -> GameResult:
-    white = AgentProcess(white_agent_path, "white")
-    black = AgentProcess(black_agent_path, "black")
+    """Play one game. ``start_fen`` defaults to the standard starting
+    position; pass an opening-book FEN to start from there instead (the
+    moves that produced it are not recorded here — the caller, e.g. the
+    gauntlet runner, knows the opening_id and can record that separately).
+    ``white_env``/``black_env`` are extra environment variables for each
+    agent's subprocess (e.g. configuring baselines/stockfish_agent.py's
+    strength for a calibration opponent)."""
+    white = AgentProcess(white_agent_path, "white", env=white_env)
+    black = AgentProcess(black_agent_path, "black", env=black_env)
     procs = {"white": white, "black": black}
+    moves_uci: list = []
     try:
         white.wait_ready()
         black.wait_ready()
         for side, proc in procs.items():
             if proc.init_ms is not None and proc.init_ms > INIT_BUDGET_MS:
-                return GameResult(_opponent(side), f"{side}_init_budget_exceeded", 0, [], [])
+                return GameResult(_opponent(side), f"{side}_init_budget_exceeded", 0, [], [], moves_uci)
 
-        board = chess.Board()
+        board = chess.Board(start_fen) if start_fen else chess.Board()
         clocks = {
             "white": SideClock(time_ms, increment_ms),
             "black": SideClock(time_ms, increment_ms),
@@ -173,7 +200,7 @@ def play_game(
 
         while not board.is_game_over(claim_draw=True):
             if board.fullmove_number > max_fullmoves:
-                return GameResult(None, "adjudicated_move_limit", board.ply(), times["white"], times["black"])
+                return GameResult(None, "adjudicated_move_limit", board.ply(), times["white"], times["black"], moves_uci)
 
             side = "white" if board.turn == chess.WHITE else "black"
             proc = procs[side]
@@ -183,20 +210,21 @@ def play_game(
             times[side].append(elapsed_ms)
 
             if clocks[side].consume(elapsed_ms):
-                return GameResult(_opponent(side), f"{side}_flag", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_flag", board.ply(), times["white"], times["black"], moves_uci)
 
             if err is not None:
-                return GameResult(_opponent(side), f"{side}_{err}", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_{err}", board.ply(), times["white"], times["black"], moves_uci)
 
             try:
                 move = chess.Move.from_uci(move_str)
             except Exception:
-                return GameResult(_opponent(side), f"{side}_illegal_move_format", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_illegal_move_format", board.ply(), times["white"], times["black"], moves_uci)
 
             if move not in board.legal_moves:
-                return GameResult(_opponent(side), f"{side}_illegal_move", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_illegal_move", board.ply(), times["white"], times["black"], moves_uci)
 
             board.push(move)
+            moves_uci.append(move_str)
 
         outcome = board.outcome(claim_draw=True)
         winner = None
@@ -206,7 +234,7 @@ def play_game(
             elif outcome.winner is False:
                 winner = "black"
         reason = outcome.termination.name.lower() if outcome is not None else "unknown"
-        return GameResult(winner, reason, board.ply(), times["white"], times["black"])
+        return GameResult(winner, reason, board.ply(), times["white"], times["black"], moves_uci)
     finally:
         white.close()
         black.close()
