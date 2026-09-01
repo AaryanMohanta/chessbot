@@ -33,6 +33,9 @@ SHIPPED_PY_FILES = [
     "cb_search.py",
     "cb_eval.py",
     "cb_time.py",
+    "cb_order.py",
+    "cb_tables.py",
+    "cb_tt.py",
 ]
 
 # Weight files are optional and picked up automatically if present at repo

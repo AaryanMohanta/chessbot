@@ -42,10 +42,26 @@ def _fallback_move(fen: str) -> str:
     raise RuntimeError(f"no legal moves available in position: {fen}")
 
 
+def _is_legal(fen: str, move_uci: str) -> bool:
+    """Re-verify the engine's answer against the FEN independently of
+    whatever internal logic produced it. A hash collision, a bug in a
+    seam not yet wired up (TT, extensions), or any other engine defect
+    that produces a well-formed but illegal UCI string must be caught
+    here — an unverified engine move is an illegal-move loss."""
+    try:
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(move_uci)
+    except Exception:
+        return False
+    return move in board.legal_moves
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     if _engine is not None:
         try:
-            return _engine.get_move(fen, time_left_ms)
+            move = _engine.get_move(fen, time_left_ms)
+            if move is not None and _is_legal(fen, move):
+                return move
         except Exception:
             pass
     return _fallback_move(fen)

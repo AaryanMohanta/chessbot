@@ -16,14 +16,21 @@ violation is caught locally instead of at validation.
 - Output cap: 4096 bytes/move. Malformed output = illegal move = loss.
 - One process per game, alive between moves, keeps its core after `get_move` returns.
 
+See `chessathon-engine-design.md` for the full architecture and the day-by-day
+plan. This repo currently implements days 1-2 of that plan: a correct,
+never-crashing, never-flagging v1 engine on python-chess. No TT, no null
+move / LMR, no numba, no NNUE, no opening book yet — those are days 3+.
+
 ## Repo layout
 
 ```
-agent.py            entry point — ships at the zip root
-cb_engine.py         \
-cb_search.py          } stubs with real signatures — ship at the zip root
-cb_eval.py            } (see "What's stubbed" below)
-cb_time.py           / time budgeting — implemented for real, not a stub
+agent.py            entry point, fallback guard — ships at the zip root
+cb_engine.py         per-game state, orchestration            \
+cb_search.py         iterative deepening, negamax, quiescence   } ship at
+cb_eval.py           tapered material + PST evaluation          } the zip
+cb_order.py          MVV-LVA move ordering                      } root
+cb_time.py           §7 time budgeting                         /
+cb_tables.py         piece-square tables (plain lists, tuner-replaceable)
 
 harness/              dev-only: subprocess wire-protocol test harness
   stdio_runner.py      subprocess entry point (loads an agent, speaks stdio JSON)
@@ -40,29 +47,56 @@ tools/
   smoke_test.py        replicates the validator's smoke checks
 
 tests/
-  positions.py          known perft positions
-  test_perft.py          wired up against python-chess's move generator
-  test_tactics.py        empty structured stubs — fill in once search/eval exist
-  test_time_management.py  invariant tests for cb_time + stubs for search-level behavior
+  positions.py          six standard perft positions
+  test_perft.py          depth<=3 fast (default run); depth 4-5 marked `slow`
+  test_tactics.py        verified mate-in-1/mate-in-2 fixtures + stubs for eval-dependent cases
+  test_time_management.py  real invariant tests for cb_time (it's plumbing, not a stub)
+  test_fallback_guard.py   proves the §3 guard by deliberately breaking the engine
 ```
 
 Only `agent.py` and the `cb_*.py` files ship in the submission zip. Everything
 else (`harness/`, `baselines/`, `tools/`, `tests/`) is local dev tooling.
 
-## What's stubbed vs. implemented
+Expensive tests (perft depth >= 4, running into millions of nodes) are
+marked `slow` and skipped by default — run them explicitly:
 
-- **Stubbed** (`NotImplementedError`-adjacent, no algorithm): `cb_search.search`
-  returns a uniformly random legal move; `cb_eval.evaluate` returns raw
-  material count. Both have real signatures and docstrings — fill in the
-  actual logic.
-- **Implemented for real**: `cb_time.TimeManager.budget` — soft/hard
-  per-move budgets from remaining time, increment, and ply. This is
-  plumbing, not chess strategy, so it's done.
+```bash
+pytest -m slow tests/test_perft.py
+```
+
+## Design choices and open questions
+
 - **Safety net**: `agent.py` wraps engine construction and every
-  `get_move` call in a guard. Any exception anywhere in `cb_engine` /
-  `cb_search` / `cb_eval` falls back to the first legal move python-chess
-  enumerates for the given FEN — dependency-free of our own (possibly
-  buggy) code, and trivially correct.
+  `get_move` call in a guard, then independently re-verifies the returned
+  move is legal against the FEN (not just "no exception was raised") —
+  see `tests/test_fallback_guard.py`, which proves this by deliberately
+  making the engine raise, lie about legality, and return garbage.
+- **Check extensions have no cap.** The design doc specifies "+1 ply when
+  in check" unconditionally. A long forced-check sequence could in theory
+  drive Python's recursion depth up; the periodic hard-time-limit node
+  check (every 2048 nodes) still fires regardless of depth, and the
+  fallback guard catches a `RecursionError` like any other exception, so
+  this can't crash a game — but it's an unbounded-recursion smell worth
+  revisiting when killers/history land in days 3-4.
+- **Quiescence delta pruning uses raw captured-piece value, not SEE.**
+  The design doc's qsearch sketch prices the margin off `see(capture)`,
+  but SEE is explicitly out of scope for v1 move ordering ("MVV-LVA, or
+  SEE if you get there"). Using full SEE for pruning while not using it
+  for ordering would be an odd asymmetry, so v1 uses the simpler
+  MVV-LVA-consistent stand-in.
+- **`cb_time`'s exact §7 formula can produce `soft > hard`** when usable
+  time is small relative to the increment (e.g. 2.5s left -> soft=459ms,
+  hard=150ms). Verified harmless (see `tests/test_time_management.py`):
+  hard is enforced independently inside the search and its wall-clock
+  deadline still lands first in that regime, so the hard cutoff always
+  wins regardless of which number is nominally bigger.
+- **Repetition tracking is partial by design.** `cb_engine` counts
+  positions it's asked to move from, keyed on everything relevant to
+  repetition *except* the move-counters — but the wire protocol only
+  hands us a FEN on our own turns, with no move history, so this can only
+  see positions where it was our move. It's bookkeeping for a future
+  search heuristic (e.g. contempt near a draw), not authoritative
+  threefold detection — the referee claims that itself.
 
 ## Running the harness
 
