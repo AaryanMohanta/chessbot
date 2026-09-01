@@ -111,6 +111,7 @@ def fit_ratings(games: list[GameRecord], anchor: str) -> RatingFit:
         if np.linalg.norm(grad) < 1e-9:
             break
         step = np.linalg.solve(hess, grad)
+        step = np.clip(step, -800.0, 800.0)  # see fit_rating_vs_known_opponents's note on Newton divergence
         r = r - step
 
     _, hess_final = grad_and_hess(r)
@@ -154,3 +155,48 @@ def fit_ratings(games: list[GameRecord], anchor: str) -> RatingFit:
 
     entries.sort(key=lambda e: e.rating, reverse=True)
     return RatingFit(anchor=anchor, entries=entries)
+
+
+def fit_rating_vs_known_opponents(observations: list[tuple[float, float]]) -> tuple[float, float]:
+    """Single-parameter MLE: our rating R against opponents of *known,
+    fixed* Elo (e.g. Stockfish capped via UCI_Elo) — the calibration-ladder
+    case, distinct from the joint multi-version fit above where every
+    rating is simultaneously unknown.
+
+    ``observations``: [(opponent_elo, our_score), ...], one per game, our
+    score in {0, 0.5, 1}. Returns (rating, ci95) — report as rating +/-
+    ci95. Same weak L2 prior as the joint fit, for the same reason: it
+    costs nothing when the data is informative and keeps the estimate
+    finite in a degenerate sweep against every tested level.
+    """
+    lam = 1.0 / (2.0 * PRIOR_STD_ELO**2)
+    opp_elos = np.array([o for o, _ in observations])
+    scores = np.array([s for _, s in observations])
+
+    def grad_and_hess(r: float) -> tuple[float, float]:
+        z = ELO_SCALE * (r - opp_elos)
+        e = _sigmoid(z)
+        grad = ELO_SCALE * np.sum(e - scores) + 2.0 * lam * r
+        hess = (ELO_SCALE**2) * np.sum(e * (1 - e)) + 2.0 * lam
+        return grad, hess
+
+    # Newton's method needs a starting point where the sigmoid has real
+    # curvature to work with. Starting at 0 while opponents sit at
+    # 1300-1900 puts z deep in the tail (Hessian ~0), which produced a
+    # divergent oscillation the first time this ran (r bouncing between
+    # -1410 and +9872 forever, never converging). Starting at the mean
+    # opponent Elo puts z near 0 immediately. A step clamp is kept as a
+    # second line of defense in case of a similarly unlucky sample.
+    r = float(np.mean(opp_elos)) if len(opp_elos) else 0.0
+    for _ in range(200):
+        grad, hess = grad_and_hess(r)
+        if abs(grad) < 1e-9:
+            break
+        step = grad / hess
+        step = max(-800.0, min(800.0, step))
+        r -= step
+
+    _, hess_final = grad_and_hess(r)
+    variance = 1.0 / hess_final
+    ci95 = Z_95 * math.sqrt(max(variance, 0.0))
+    return r, ci95

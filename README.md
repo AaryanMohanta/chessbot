@@ -97,6 +97,35 @@ pytest -m slow tests/test_perft.py
   see positions where it was our move. It's bookkeeping for a future
   search heuristic (e.g. contempt near a draw), not authoritative
   threefold detection — the referee claims that itself.
+- **Null-move pruning and LMR were each SPRT-tested against the version
+  immediately before it, not against each other factorially** — null-move
+  was tested with LMR off on both sides, LMR was tested with null-move on
+  on both sides. Both scored positive (52% and 57% over 100 games each,
+  both inconclusive against a 0/20 Elo bound — see
+  `ratings/calibration_logs/`, gitignored) and neither regressed, so both
+  are kept on. But because they weren't tested factorially, **their
+  measured effects are not additive** — don't read "null-move is worth
+  ~+14 Elo and LMR is worth ~+49 Elo" as "the pair is worth +63"; the two
+  techniques interact (LMR's reductions change which lines null-move's
+  verification search even reaches), and only a joint test would say by
+  how much.
+- **SPRT bounds and game budgets, standardized:** [0, 10] Elo for a novel
+  change, [-10, 0] (non-regression) for a change with a strong literature
+  prior, 4000-8000 games. Narrower bounds need *more* games, not fewer —
+  expected sample size scales roughly as 1/(elo1-elo0)^2, so don't reach
+  for [0, 5] hoping for a faster answer; it costs ~16x the games of
+  [0, 20] for the same statistical power. `ratings/sprt.py`'s
+  `run_sprt_pentanomial` pairs games from the same opening with reversed
+  colours (a GSPRT on the paired-score distribution) for the same
+  variance-reduction benefit cutechess-cli/fastchess get from pentanomial
+  LLR — implemented directly rather than adopted from either tool, since
+  our agent speaks a custom JSON wire protocol, not UCI, so a UCI-only
+  driver can't run it regardless.
+- **All testing (SPRT and Stockfish calibration) runs at a fast time
+  control (10+0.1), not the tournament one (120+0.5).** The tournament
+  clock is reserved for final validation runs and the wire-protocol smoke
+  test — nobody SPRTs at their competition TC, it's needlessly slow for
+  no statistical benefit.
 
 ## Running the harness
 

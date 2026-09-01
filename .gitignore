@@ -17,6 +17,12 @@ ratings/ladder.png
 # either way — each dev fetches their own via tools/setup_stockfish.md.
 tools/stockfish/
 
+# Downloaded third-party opening book (official-stockfish/books,
+# 8moves_v3.pgn, ~8MB/34.7k lines) used for calibration/SPRT variety —
+# not authored here, re-fetched via ratings/calibrate_stockfish.py's
+# --openings-pgn default download logic rather than checked in.
+tools/books/
+
 # Ad-hoc run logs from manual calibration/SPRT sessions — ephemeral
 # diagnostic output, not infrastructure. games.csv (the real record of
 # every game played) and zoo/ are tracked; these raw logs are not.

@@ -16,6 +16,7 @@ harness passes these via AgentProcess(..., env=...) per gauntlet leg):
     STOCKFISH_ELO    if set: setoption UCI_LimitStrength=true, UCI_Elo=<N>
     STOCKFISH_SKILL  if set (and STOCKFISH_ELO isn't): setoption Skill Level=<N>
     STOCKFISH_THREADS  default "1", matching the competition's 1-core constraint
+    STOCKFISH_HASH_MB  default "16" (small on purpose — no hardware edge over our engine)
 
 If neither STOCKFISH_ELO nor STOCKFISH_SKILL is set, Stockfish runs at
 full strength (Skill Level 20, UCI_LimitStrength false) — not useful for
@@ -38,6 +39,7 @@ if not _STOCKFISH_PATH:
 _ELO = os.environ.get("STOCKFISH_ELO")
 _SKILL = os.environ.get("STOCKFISH_SKILL")
 _THREADS = os.environ.get("STOCKFISH_THREADS", "1")
+_HASH_MB = os.environ.get("STOCKFISH_HASH_MB", "16")  # small on purpose: no hardware edge over our engine
 
 
 class _StockfishUCI:
@@ -78,6 +80,7 @@ class _StockfishUCI:
 
     def _configure(self) -> None:
         self._send(f"setoption name Threads value {_THREADS}")
+        self._send(f"setoption name Hash value {_HASH_MB}")
         if _ELO:
             self._send("setoption name UCI_LimitStrength value true")
             self._send(f"setoption name UCI_Elo value {_ELO}")
