@@ -20,7 +20,20 @@ from harness.clock import SideClock
 DEFAULT_TIME_MS = 120_000
 DEFAULT_INCREMENT_MS = 500
 MAX_OUTPUT_BYTES = 4096
-MAX_FULLMOVES = 300  # adjudicate as a draw beyond this, rather than loop forever
+MAX_PLIES = 300  # matches the competition's own 300-ply adjudication-on-material rule
+
+# Score-based adjudication (self-play testing only -- see play_game's
+# ``adjudicate`` param and AgentProcess.request_move's optional score).
+# Long dead endgames are a large fraction of wall clock in dev SPRT and
+# contribute almost nothing to the statistical signal, so cutting them
+# short (only when both sides are actually reporting a score, i.e. our
+# own agents playing each other -- Stockfish/third-party opponents don't
+# report one over this wire protocol, so adjudication silently never
+# triggers against them) is close to free throughput.
+RESIGN_THRESHOLD_CP = 600
+RESIGN_CONSECUTIVE_PLIES = 4
+DRAW_SCORE_EPSILON_CP = 5  # "0cp" with a little slack for engine rounding
+DRAW_CONSECUTIVE_PLIES = 60
 
 _STDIO_RUNNER = os.path.join(os.path.dirname(__file__), "stdio_runner.py")
 
@@ -32,16 +45,33 @@ class AgentProcess:
     timed out cross-platform (no reliance on POSIX-only select() on pipes).
     """
 
-    def __init__(self, agent_path: str, name: str):
+    def __init__(self, agent_path: str, name: str, env: dict | None = None, cpu_affinity: int | None = None):
         self.name = name
         self.agent_path = agent_path
+        proc_env = {**os.environ, **env} if env else None
+        # cpu_affinity: hard-pin this process to one specific core via
+        # taskset (Linux only), rather than relying on a cgroup CPU quota
+        # (e.g. docker --cpus=N) to keep concurrent games from stealing
+        # cycles from each other. A soft quota shared between two
+        # processes (this agent + its opponent) was observed to starve
+        # the numba compile badly enough to cause spurious
+        # init_budget_exceeded losses under concurrent load -- a
+        # test-harness artifact, not real engine weakness.
+        command = [sys.executable, _STDIO_RUNNER, agent_path]
+        if cpu_affinity is not None and sys.platform.startswith("linux"):
+            # taskset doesn't exist on Windows -- silently skip pinning
+            # there rather than fail every subprocess launch. Local dev
+            # runs (Windows) get no pinning; the Linux reference
+            # container (and WSL) get real pinning.
+            command = ["taskset", "-c", str(cpu_affinity)] + command
         self.proc = subprocess.Popen(
-            [sys.executable, _STDIO_RUNNER, agent_path],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=proc_env,
         )
         self.init_ms: float | None = None
         self._queue: "queue.Queue[str]" = queue.Queue()
@@ -77,36 +107,43 @@ class AgentProcess:
 
     def request_move(
         self, fen: str, time_left_ms: float, timeout_s: float
-    ) -> tuple[str | None, float, str | None]:
-        """Returns (move_uci_or_None, elapsed_ms, error_reason_or_None)."""
+    ) -> tuple[str | None, float, str | None, float | None]:
+        """Returns (move_uci_or_None, elapsed_ms, error_reason_or_None,
+        score_cp_or_None). ``score`` is the mover's own last-search score
+        in centipawns from the mover's perspective (None if the agent
+        doesn't report one -- see stdio_runner.py's optional
+        get_last_score() hook, and agent.py's -- purely diagnostic, never
+        required by the real get_move contract)."""
         request = json.dumps({"fen": fen, "time_left_ms": int(time_left_ms)}) + "\n"
         start = time.perf_counter()
         try:
             self.proc.stdin.write(request)
             self.proc.stdin.flush()
         except Exception as exc:
-            return None, 0.0, f"stdin_write_failed:{exc}"
+            return None, 0.0, f"stdin_write_failed:{exc}", None
 
         line = self._readline(timeout_s)
         elapsed_ms = (time.perf_counter() - start) * 1000
         if line is None:
-            return None, elapsed_ms, "timeout_or_crash"
+            return None, elapsed_ms, "timeout_or_crash", None
 
         payload_bytes = len(line.encode("utf-8"))
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
-            return None, elapsed_ms, "malformed_output"
+            return None, elapsed_ms, "malformed_output", None
 
         if payload_bytes > MAX_OUTPUT_BYTES:
-            return None, elapsed_ms, f"output_too_large:{payload_bytes}"
+            return None, elapsed_ms, f"output_too_large:{payload_bytes}", None
         if "error" in msg:
-            return None, elapsed_ms, f"engine_error:{msg['error']}"
+            return None, elapsed_ms, f"engine_error:{msg['error']}", None
 
         move = msg.get("move")
         if not isinstance(move, str):
-            return None, elapsed_ms, "malformed_output"
-        return move, elapsed_ms, None
+            return None, elapsed_ms, "malformed_output", None
+        score = msg.get("score")
+        score = float(score) if isinstance(score, (int, float)) else None
+        return move, elapsed_ms, None, score
 
     def _drain_stderr(self, max_chars: int = 2000) -> str:
         try:
@@ -120,8 +157,21 @@ class AgentProcess:
         return data
 
     def close(self) -> None:
+        """Close stdin (EOF) and give the process a chance to exit on its
+        own before escalating to terminate/kill. This matters beyond tidy
+        shutdown: a well-behaved agent (ours, or a wrapper around a nested
+        subprocess like the Stockfish calibration opponent) runs its own
+        cleanup — e.g. telling a child engine process to quit — when its
+        stdin loop ends naturally. TerminateProcess on Windows (what
+        subprocess.terminate() does) skips all of that and would orphan
+        any subprocess the agent itself spawned."""
         try:
             self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+            return
         except Exception:
             pass
         try:
@@ -141,6 +191,7 @@ class GameResult:
     plies: int
     white_times_ms: list
     black_times_ms: list
+    moves_uci: list = dataclasses.field(default_factory=list)
 
 
 def _opponent(side: str) -> str:
@@ -152,51 +203,91 @@ def play_game(
     black_agent_path: str,
     time_ms: float = DEFAULT_TIME_MS,
     increment_ms: float = DEFAULT_INCREMENT_MS,
-    max_fullmoves: int = MAX_FULLMOVES,
+    max_plies: int = MAX_PLIES,
+    start_fen: str | None = None,
+    white_env: dict | None = None,
+    black_env: dict | None = None,
+    white_cpu: int | None = None,
+    black_cpu: int | None = None,
+    adjudicate: bool = True,
 ) -> GameResult:
-    white = AgentProcess(white_agent_path, "white")
-    black = AgentProcess(black_agent_path, "black")
+    """Play one game. ``start_fen`` defaults to the standard starting
+    position; pass an opening-book FEN to start from there instead (the
+    moves that produced it are not recorded here — the caller, e.g. the
+    gauntlet runner, knows the opening_id and can record that separately).
+    ``white_env``/``black_env`` are extra environment variables for each
+    agent's subprocess (e.g. configuring baselines/stockfish_agent.py's
+    strength for a calibration opponent). ``white_cpu``/``black_cpu``
+    optionally hard-pin each side to one core via taskset — see
+    AgentProcess's cpu_affinity docstring. ``adjudicate`` enables the
+    resign/draw score-based cutoffs (see module constants) -- they only
+    ever fire when both sides are reporting a score each move, which in
+    practice means both sides are our own agent.py; against an opponent
+    that doesn't report one, games always run to a real conclusion (or
+    the ``max_plies`` cap) regardless of this flag."""
+    white = AgentProcess(white_agent_path, "white", env=white_env, cpu_affinity=white_cpu)
+    black = AgentProcess(black_agent_path, "black", env=black_env, cpu_affinity=black_cpu)
     procs = {"white": white, "black": black}
+    moves_uci: list = []
     try:
         white.wait_ready()
         black.wait_ready()
         for side, proc in procs.items():
             if proc.init_ms is not None and proc.init_ms > INIT_BUDGET_MS:
-                return GameResult(_opponent(side), f"{side}_init_budget_exceeded", 0, [], [])
+                return GameResult(_opponent(side), f"{side}_init_budget_exceeded", 0, [], [], moves_uci)
 
-        board = chess.Board()
+        board = chess.Board(start_fen) if start_fen else chess.Board()
         clocks = {
             "white": SideClock(time_ms, increment_ms),
             "black": SideClock(time_ms, increment_ms),
         }
         times = {"white": [], "black": []}
+        recent_white_pov_scores: list[float] = []  # every ply with a reported score, white's POV
 
         while not board.is_game_over(claim_draw=True):
-            if board.fullmove_number > max_fullmoves:
-                return GameResult(None, "adjudicated_move_limit", board.ply(), times["white"], times["black"])
+            if board.ply() >= max_plies:
+                return GameResult(None, "adjudicated_move_limit", board.ply(), times["white"], times["black"], moves_uci)
 
             side = "white" if board.turn == chess.WHITE else "black"
             proc = procs[side]
             timeout_s = clocks[side].remaining_ms / 1000 + 2  # IPC/OS grace only
 
-            move_str, elapsed_ms, err = proc.request_move(board.fen(), clocks[side].remaining_ms, timeout_s)
+            move_str, elapsed_ms, err, score = proc.request_move(board.fen(), clocks[side].remaining_ms, timeout_s)
             times[side].append(elapsed_ms)
 
             if clocks[side].consume(elapsed_ms):
-                return GameResult(_opponent(side), f"{side}_flag", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_flag", board.ply(), times["white"], times["black"], moves_uci)
 
             if err is not None:
-                return GameResult(_opponent(side), f"{side}_{err}", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_{err}", board.ply(), times["white"], times["black"], moves_uci)
 
             try:
                 move = chess.Move.from_uci(move_str)
             except Exception:
-                return GameResult(_opponent(side), f"{side}_illegal_move_format", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_illegal_move_format", board.ply(), times["white"], times["black"], moves_uci)
 
             if move not in board.legal_moves:
-                return GameResult(_opponent(side), f"{side}_illegal_move", board.ply(), times["white"], times["black"])
+                return GameResult(_opponent(side), f"{side}_illegal_move", board.ply(), times["white"], times["black"], moves_uci)
 
             board.push(move)
+            moves_uci.append(move_str)
+
+            if adjudicate:
+                if score is None:
+                    recent_white_pov_scores.clear()  # one side not reporting -- can't trust "both agree"
+                else:
+                    white_pov = score if side == "white" else -score
+                    recent_white_pov_scores.append(white_pov)
+
+                    tail = recent_white_pov_scores[-RESIGN_CONSECUTIVE_PLIES:]
+                    if len(tail) == RESIGN_CONSECUTIVE_PLIES and all(s >= RESIGN_THRESHOLD_CP for s in tail):
+                        return GameResult("white", "adjudicated_resign", board.ply(), times["white"], times["black"], moves_uci)
+                    if len(tail) == RESIGN_CONSECUTIVE_PLIES and all(s <= -RESIGN_THRESHOLD_CP for s in tail):
+                        return GameResult("black", "adjudicated_resign", board.ply(), times["white"], times["black"], moves_uci)
+
+                    draw_tail = recent_white_pov_scores[-DRAW_CONSECUTIVE_PLIES:]
+                    if len(draw_tail) == DRAW_CONSECUTIVE_PLIES and all(abs(s) <= DRAW_SCORE_EPSILON_CP for s in draw_tail):
+                        return GameResult(None, "adjudicated_draw", board.ply(), times["white"], times["black"], moves_uci)
 
         outcome = board.outcome(claim_draw=True)
         winner = None
@@ -206,7 +297,7 @@ def play_game(
             elif outcome.winner is False:
                 winner = "black"
         reason = outcome.termination.name.lower() if outcome is not None else "unknown"
-        return GameResult(winner, reason, board.ply(), times["white"], times["black"])
+        return GameResult(winner, reason, board.ply(), times["white"], times["black"], moves_uci)
     finally:
         white.close()
         black.close()

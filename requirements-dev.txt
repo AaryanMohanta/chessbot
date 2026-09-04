@@ -13,3 +13,9 @@ numba==0.67.0
 
 # Harness/test tooling (dev-only, not part of the runtime constraint).
 pytest>=8.0
+
+# Rating tooling (ratings/), dev-only: not part of the runtime constraint
+# either, since none of ratings/ ships in the submission zip. The MLE fit
+# is hand-rolled Newton's method on numpy (already pinned above); only the
+# history plot needs matplotlib.
+matplotlib>=3.8

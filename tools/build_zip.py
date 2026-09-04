@@ -33,6 +33,20 @@ SHIPPED_PY_FILES = [
     "cb_search.py",
     "cb_eval.py",
     "cb_time.py",
+    "cb_order.py",
+    "cb_tables.py",
+    "cb_tt.py",
+    "cb_nb_tables.py",
+    "cb_nb_fast.py",
+    "cb_nb_search.py",
+    "cb_nb_engine.py",
+    "cb_book.py",
+]
+
+# Explicit, not a glob, same reasoning as SHIPPED_PY_FILES above -- named
+# individually even though it's the only one today.
+SHIPPED_DATA_FILES = [
+    "cb_book.bin",
 ]
 
 # Weight files are optional and picked up automatically if present at repo
@@ -138,7 +152,8 @@ def build(output_path: Path = DEFAULT_OUTPUT) -> None:
     check_filename_shadowing(SHIPPED_PY_FILES, errors)
 
     weight_files = discover_weight_files()
-    shipped_paths = [REPO_ROOT / f for f in SHIPPED_PY_FILES] + weight_files
+    data_files = [REPO_ROOT / f for f in SHIPPED_DATA_FILES]
+    shipped_paths = [REPO_ROOT / f for f in SHIPPED_PY_FILES] + data_files + weight_files
     existing_paths = [p for p in shipped_paths if p.exists()]
 
     check_forbidden_files(existing_paths, errors)
