@@ -74,6 +74,35 @@ KING_ATTACKS = np.array([_king_attacks(s) for s in range(64)], dtype=np.uint64)
 PAWN_ATTACKS = np.array([[_pawn_attacks(s, c) for s in range(64)] for c in range(2)], dtype=np.uint64)
 
 
+def _adjacent_files_mask(file: int) -> int:
+    mask = 0
+    for f in (file - 1, file + 1):
+        if 0 <= f < 8:
+            mask |= int(FILE_MASKS[f])
+    return mask
+
+
+def _passed_pawn_mask(square: int, color: int) -> int:
+    """Squares on square's own file and the two adjacent files, on every
+    rank strictly ahead of it (white: higher rank; black: lower rank).
+    A pawn is passed iff none of the opposing colour's pawns occupy any
+    of these squares."""
+    rank, file = divmod(square, 8)
+    own_and_adjacent = int(FILE_MASKS[file]) | _adjacent_files_mask(file)
+    if color == WHITE:
+        ahead_ranks = [r for r in range(rank + 1, 8)]
+    else:
+        ahead_ranks = [r for r in range(0, rank)]
+    ahead_mask = 0
+    for r in ahead_ranks:
+        ahead_mask |= int(RANK_MASKS[r])
+    return own_and_adjacent & ahead_mask
+
+
+ADJACENT_FILES_MASK = np.array([_adjacent_files_mask(f) for f in range(8)], dtype=np.uint64)
+PASSED_PAWN_MASK = np.array([[_passed_pawn_mask(s, c) for s in range(64)] for c in range(2)], dtype=np.uint64)
+
+
 # ---- Magic bitboard sliding attacks (rook, bishop) ----
 # fmt: off
 ROOK_MAGICS = [

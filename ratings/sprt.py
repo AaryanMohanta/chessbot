@@ -24,12 +24,25 @@ fishtest uses for pentanomial LLR, expressed directly rather than adopted
 from a specific tool (our agent speaks a custom wire protocol, not UCI, so
 UCI-only tools like cutechess-cli/fastchess can't drive it regardless).
 
-Standard bounds used elsewhere in this repo from here on: [0, 10] Elo for
+Standard bounds used elsewhere in this repo from here on: [0, 15] Elo for
 a novel change, [-10, 0] (non-regression) for a change with a strong
 literature prior. Narrower bounds need MORE games, not fewer — expected
-sample size scales roughly as 1/(elo1-elo0)^2 — so don't reach for [0, 5]
-just because it "sounds more rigorous"; it costs ~16x the games of [0, 20]
-for the same power.
+sample size scales roughly as 1/(elo1-elo0)^2 — [0, 15] was widened from an
+earlier [0, 10] for exactly that reason: precision we weren't acting on
+was costing real wall-clock time we needed elsewhere.
+
+Concurrency and CPU pinning: each pentanomial pair runs its two games
+sequentially within one thread-pool slot (not simultaneously), so one
+slot only ever has one game's two processes (white+black) alive at a
+time. ``cpu_pin=True`` hard-pins each slot to its own two cores (via
+harness.match.play_game's white_cpu/black_cpu, Linux/taskset only --
+see AgentProcess) instead of letting the OS scheduler place unpinned
+processes freely. That removes the main reason concurrency was kept low:
+unpinned processes (especially numba's LLVM JIT, which can transiently
+use extra threads) were observed to steal cycles from their neighbors
+under high concurrency, which is a test-harness artifact, not real
+engine weakness. Pinned, concurrency can go up to roughly
+(available_cores // 2) without that cross-talk.
 """
 from __future__ import annotations
 
@@ -46,8 +59,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from harness.match import DEFAULT_INCREMENT_MS, DEFAULT_TIME_MS, play_game  # noqa: E402
 from ratings.book import OPENING_BOOK  # noqa: E402
 
-FAST_TIME_MS = 10_000
-FAST_INCREMENT_MS = 100
+FAST_TIME_MS = 5_000
+FAST_INCREMENT_MS = 50
 
 
 def _elo_to_p(elo: float) -> float:
@@ -121,13 +134,18 @@ def run_sprt(
     return {"decision": "inconclusive", "reason": f"hit max_games={max_games} without crossing a bound", "games": max_games, "llr": llr, "wins": wins, "draws": draws, "losses": losses}
 
 
-def _play_pair(candidate_path, baseline_path, fen, time_ms, increment_ms, candidate_env, baseline_env):
+def _play_pair(candidate_path, baseline_path, fen, time_ms, increment_ms, candidate_env, baseline_env, cpu_a=None, cpu_b=None):
     """One pair: candidate plays both colours from the same opening.
-    Returns the candidate's combined score across the two games (0..2)."""
-    r1 = play_game(candidate_path, baseline_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=candidate_env, black_env=baseline_env)
+    Returns the candidate's combined score across the two games (0..2).
+
+    The pair's two games run sequentially (not concurrently) within
+    whichever thread-pool slot called this, so the same two cores
+    (``cpu_a``, ``cpu_b``) are reused for both -- one slot, two cores,
+    regardless of which side is which colour in each game."""
+    r1 = play_game(candidate_path, baseline_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=candidate_env, black_env=baseline_env, white_cpu=cpu_a, black_cpu=cpu_b)
     s1 = {"white": 1.0, "black": 0.0, None: 0.5}[r1.winner]
 
-    r2 = play_game(baseline_path, candidate_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=baseline_env, black_env=candidate_env)
+    r2 = play_game(baseline_path, candidate_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=baseline_env, black_env=candidate_env, white_cpu=cpu_a, black_cpu=cpu_b)
     s2 = {"black": 1.0, "white": 0.0, None: 0.5}[r2.winner]
 
     return s1 + s2, (r1.reason, r2.reason)
@@ -143,10 +161,11 @@ def run_sprt_pentanomial(
     max_pairs: int = 3000,
     time_ms: float = FAST_TIME_MS,
     increment_ms: float = FAST_INCREMENT_MS,
-    concurrency: int = 8,
+    concurrency: int = 7,  # this dev box's ceiling: 7 physical cores, see module docstring
     openings: list[tuple[str, str]] | None = None,
     candidate_env: dict | None = None,
     baseline_env: dict | None = None,
+    cpu_pin: bool = True,
 ) -> dict:
     """GSPRT on paired (same-opening, reversed-colour) game scores.
 
@@ -158,6 +177,12 @@ def run_sprt_pentanomial(
     rule after each batch completes — a pair in flight when the test would
     conclude is allowed to finish rather than cancelled, so the final game
     count can overshoot the crossing point by up to concurrency-1 pairs.
+
+    ``cpu_pin``: hard-pin each concurrent slot to its own 2 cores (see
+    module docstring). Needs ``concurrency * 2`` cores to avoid
+    oversubscription -- pass ``False`` (or reduce concurrency) on a
+    smaller box; pinning silently no-ops on non-Linux regardless (see
+    harness.match.AgentProcess).
     """
     if openings is None:
         openings = [(oid, fen) for oid, _moves, fen in OPENING_BOOK]
@@ -168,6 +193,9 @@ def run_sprt_pentanomial(
 
     lock = threading.Lock()
     pair_scores: list[float] = []
+    flag_counts = {"candidate": 0, "baseline": 0}
+    games_played = 0
+    errored_pairs = 0
 
     def llr_from_pairs() -> float:
         n = len(pair_scores)
@@ -188,36 +216,85 @@ def run_sprt_pentanomial(
             futures = []
             for i in range(batch):
                 opening_id, fen = openings[(pairs_done + i) % len(openings)]
-                futures.append((opening_id, pool.submit(_play_pair, candidate_path, baseline_path, fen, time_ms, increment_ms, candidate_env, baseline_env)))
+                cpu_a, cpu_b = (2 * i, 2 * i + 1) if cpu_pin else (None, None)
+                futures.append((opening_id, pool.submit(
+                    _play_pair, candidate_path, baseline_path, fen, time_ms, increment_ms,
+                    candidate_env, baseline_env, cpu_a, cpu_b,
+                )))
 
             for opening_id, future in futures:
-                pair_score, reasons = future.result()
+                try:
+                    pair_score, reasons = future.result()
+                except Exception as exc:
+                    # A transient failure (observed cause: numba/LLVM
+                    # compilation occasionally erroring under heavy
+                    # concurrent load -- up to 2x concurrency simultaneous
+                    # compiles when both candidate and baseline are numba
+                    # agents, vs. 1x when one side is a plain-Python
+                    # baseline) must not take down an entire overnight
+                    # SPRT run over one bad pair. Skipped from
+                    # pair_scores/flag_counts (it carries no chess
+                    # information either way) but still counted against
+                    # pairs_done so a persistently-crashing setup can't
+                    # spin forever without ever hitting max_pairs.
+                    with lock:
+                        errored_pairs += 1
+                    print(f"  WARNING: pair for opening {opening_id!r} errored, skipping: {exc!r}", flush=True)
+                    pairs_done += 1
+                    continue
                 # pair_score in {0, 0.5, 1, 1.5, 2}. Not decomposed into a
                 # W/D/L breakdown here: a pair scoring 1.0 could be either
                 # two draws or one win and one loss, and the two aren't
                 # equivalent at the individual-game level — the pentanomial
                 # bucket itself (this pair_score) is the meaningful unit,
                 # not a derived per-game count.
+                # reasons = (r1.reason, r2.reason): r1 has candidate as
+                # white/baseline as black, r2 is the reversed colours --
+                # a permanent tracked metric (see ratings/
+                # report_containerized_calibration.py's flag_rate_report),
+                # not a one-off diagnostic. Should always be zero; the
+                # bug that motivated tracking this was invisible to every
+                # existing unit test, only a real per-game flag rate
+                # surfaced it.
+                r1_reason, r2_reason = reasons
+                side_flags = {"candidate": 0, "baseline": 0}
+                if r1_reason == "white_flag":
+                    side_flags["candidate"] += 1
+                elif r1_reason == "black_flag":
+                    side_flags["baseline"] += 1
+                if r2_reason == "white_flag":
+                    side_flags["baseline"] += 1
+                elif r2_reason == "black_flag":
+                    side_flags["candidate"] += 1
                 with lock:
                     pair_scores.append(pair_score)
+                    flag_counts["candidate"] += side_flags["candidate"]
+                    flag_counts["baseline"] += side_flags["baseline"]
                 pairs_done += 1
 
             current_llr = llr_from_pairs()
             n_pairs = len(pair_scores)
-            mean_score = sum(pair_scores) / n_pairs
+            games_played = n_pairs * 2
+            mean_score = sum(pair_scores) / n_pairs if n_pairs else 0.0
             print(
-                f"pair {n_pairs}/{max_pairs} (batch of {batch}): mean_pair_score={mean_score:.3f}/2  "
-                f"LLR={current_llr:+.3f}  bounds=[{lower:.3f}, {upper:.3f}]",
+                f"pair {n_pairs}/{max_pairs} (batch of {batch}, {errored_pairs} errored so far): "
+                f"mean_pair_score={mean_score:.3f}/2  "
+                f"LLR={current_llr:+.3f}  bounds=[{lower:.3f}, {upper:.3f}]  "
+                f"flags: candidate={flag_counts['candidate']}/{games_played} "
+                f"({100*flag_counts['candidate']/games_played if games_played else 0:.1f}%), "
+                f"baseline={flag_counts['baseline']}/{games_played} "
+                f"({100*flag_counts['baseline']/games_played if games_played else 0:.1f}%)",
                 flush=True,
             )
 
             if current_llr >= upper:
-                return {"decision": "H1", "reason": f"candidate is >= {elo1} Elo stronger", "pairs": n_pairs, "games": n_pairs * 2, "llr": current_llr, "mean_pair_score": mean_score}
+                return {"decision": "H1", "reason": f"candidate is >= {elo1} Elo stronger", "pairs": n_pairs, "games": n_pairs * 2, "llr": current_llr, "mean_pair_score": mean_score, "flag_counts": dict(flag_counts), "errored_pairs": errored_pairs}
             if current_llr <= lower:
-                return {"decision": "H0", "reason": f"candidate is not >= {elo0} Elo stronger", "pairs": n_pairs, "games": n_pairs * 2, "llr": current_llr, "mean_pair_score": mean_score}
+                return {"decision": "H0", "reason": f"candidate is not >= {elo0} Elo stronger", "pairs": n_pairs, "games": n_pairs * 2, "llr": current_llr, "mean_pair_score": mean_score, "flag_counts": dict(flag_counts), "errored_pairs": errored_pairs}
 
     final_llr = llr_from_pairs()
-    return {"decision": "inconclusive", "reason": f"hit max_pairs={max_pairs} without crossing a bound", "pairs": len(pair_scores), "games": len(pair_scores) * 2, "llr": final_llr, "mean_pair_score": sum(pair_scores) / len(pair_scores)}
+    final_n = len(pair_scores)
+    return {"decision": "inconclusive", "reason": f"hit max_pairs={max_pairs} without crossing a bound", "pairs": final_n, "games": final_n * 2, "llr": final_llr, "mean_pair_score": (sum(pair_scores) / final_n if final_n else 0.0), "flag_counts": dict(flag_counts), "errored_pairs": errored_pairs}
 
 
 def main() -> int:
@@ -225,20 +302,21 @@ def main() -> int:
     parser.add_argument("candidate_path")
     parser.add_argument("baseline_path")
     parser.add_argument("--elo0", type=float, default=0.0)
-    parser.add_argument("--elo1", type=float, default=10.0)
+    parser.add_argument("--elo1", type=float, default=15.0)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--beta", type=float, default=0.05)
     parser.add_argument("--max-pairs", type=int, default=3000)
     parser.add_argument("--time-ms", type=float, default=FAST_TIME_MS)
     parser.add_argument("--increment-ms", type=float, default=FAST_INCREMENT_MS)
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--concurrency", type=int, default=7)
+    parser.add_argument("--no-cpu-pin", action="store_true", help="disable core pinning (use on a small box, or where concurrency*2 exceeds available cores)")
     parser.add_argument("--simple", action="store_true", help="use the older per-game Bernoulli SPRT instead of pentanomial pairing")
     args = parser.parse_args()
 
     if args.simple:
         outcome = run_sprt(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_games=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms)
     else:
-        outcome = run_sprt_pentanomial(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_pairs=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms, concurrency=args.concurrency)
+        outcome = run_sprt_pentanomial(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_pairs=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms, concurrency=args.concurrency, cpu_pin=not args.no_cpu_pin)
 
     print()
     print(f"DECISION: {outcome['decision']} - {outcome['reason']} after {outcome['games']} games (LLR={outcome['llr']:+.3f})")

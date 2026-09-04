@@ -1,9 +1,10 @@
 """Time management: converts a clock reading into a per-move thinking budget.
 
-Implements the design doc's §7 formula exactly:
+Based on the design doc's §7 formula, with MIN_MOVES_TO_GO/MOVES_TO_GO_BASE
+retuned (2026-09) from real game-length data instead of the original guess:
 
     reserve      = 2000 ms
-    moves_to_go  = max(20, 55 - ply // 2)
+    moves_to_go  = max(15, 50 - ply // 2)
     usable       = max(0, time_left - reserve)
     soft         = increment * 0.9 + usable / moves_to_go
     hard         = min(soft * 4, usable * 0.3)
@@ -36,8 +37,15 @@ INIT_BUDGET_MS = 60_000
 DEFAULT_INCREMENT_MS = 500
 
 RESERVE_MS = 2_000
-MIN_MOVES_TO_GO = 20
-MOVES_TO_GO_BASE = 55
+# Retest (2026-09): re-derived from real game lengths rather than the
+# original guess -- the 20-game match vs. a comparable-strength opponent
+# at this exact TC had a median length of 47 full moves (mean 45, range
+# 13.5-69.5), not ~55. MIN lowered from 20 and BASE from 55 so later
+# moves get a meaningfully bigger slice of what's left, without being so
+# aggressive it risks flagging on the long tail of real games (simulated
+# steady-state spend: ~80% of the clock by move 40, ~87% by move 47).
+MIN_MOVES_TO_GO = 15
+MOVES_TO_GO_BASE = 50
 HARD_SOFT_MULTIPLE = 4
 HARD_FRACTION_OF_USABLE = 0.3
 

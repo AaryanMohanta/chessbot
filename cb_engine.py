@@ -50,6 +50,7 @@ class Engine:
         # having to clear the whole table between moves.
         self.tt = TranspositionTable()
         self.generation = 0
+        self.last_score: int | None = None  # centipawns, mover's perspective -- diagnostic only, see harness.match
 
         # TODO (v2/numba): load weights, warm up onnxruntime/numba JIT here,
         # inside this same budget.
@@ -70,5 +71,6 @@ class Engine:
         budget = self.time_manager.budget(time_left_ms, ply=ply)
 
         self.generation += 1
-        move, _score, _info = cb_search.search(board, budget.soft_ms, budget.hard_ms, self.tt, self.generation)
+        move, score, _info = cb_search.search(board, budget.soft_ms, budget.hard_ms, self.tt, self.generation)
+        self.last_score = score
         return move.uci()

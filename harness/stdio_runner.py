@@ -51,6 +51,8 @@ def main() -> None:
     sys.stdout.write(json.dumps({"status": "ready"}) + "\n")
     sys.stdout.flush()
 
+    get_last_score = getattr(module, "get_last_score", None)
+
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -58,7 +60,13 @@ def main() -> None:
         try:
             request = json.loads(line)
             move = module.get_move(request["fen"], int(request["time_left_ms"]))
-            response = json.dumps({"move": move})
+            score = None
+            if get_last_score is not None:
+                try:
+                    score = get_last_score()
+                except Exception:
+                    score = None
+            response = json.dumps({"move": move, "score": score})
         except Exception as exc:  # the whole point: never let this crash the loop
             response = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
         sys.stdout.write(response + "\n")

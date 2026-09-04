@@ -40,10 +40,10 @@ def test_near_reserve_yields_zero_hard_budget(tm):
     assert budget.hard_ms == 0
 
 
-def test_moves_to_go_floors_at_twenty(tm):
-    assert tm.estimate_moves_to_go(0) == 55
-    assert tm.estimate_moves_to_go(200) == 20
-    assert tm.estimate_moves_to_go(1_000) == 20
+def test_moves_to_go_floors_at_fifteen(tm):
+    assert tm.estimate_moves_to_go(0) == 50
+    assert tm.estimate_moves_to_go(200) == 15
+    assert tm.estimate_moves_to_go(1_000) == 15
 
 
 def test_budget_grows_as_moves_to_go_shrinks_with_fixed_time(tm):

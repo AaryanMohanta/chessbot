@@ -172,3 +172,43 @@ native binaries and `__pycache__`, and checks total unzipped size against
 the 50 MB cap. It refuses to write the zip if anything fails, and prints
 the size and file list on success. Output goes to `dist/submission.zip`
 (pass a different path as the first argument to override).
+
+## Numba bitboard experiment (`cb_nb_*.py`) — parallel, unshipped
+
+Not in `tools/build_zip.py`'s whitelist and doesn't touch `agent.py` or
+any shipped module — v1 (`cb_search.py` on python-chess) stays the
+fallback and the perft oracle throughout. Status by stage:
+
+| Stage | What | Gate | Result |
+|---|---|---|---|
+| 1 | Flat bitboard representation, FEN parse/serialize | 10k-position round-trip vs python-chess | 0 errors / 11,859 |
+| 2 | Movegen + make/unmake (magic bitboards, self-verified) | Perft exact, depth 5 (6 for startpos), all six standard positions | Exact, 1.1-1.6M nps |
+| 3 | Incremental Zobrist through make/unmake | Matches from-scratch recompute at every node, full games | 0 errors / 31,880+ checks |
+| 4 | Incremental material+PST (reuses v1's `cb_tables.py` data) | Same treatment as stage 3, plus cross-check vs v1's `cb_eval.py` | 0 errors; exact match on a real position |
+| 5 | Search (negamax/PVS/quiescence/TT/MVV-LVA) ported into njit | Real search nps on middlegame positions; mate-in-1/2 fixtures; node-for-node match vs v1 | See below |
+
+**Stage 5 result: median 1.1M search nps, median depth 7.0** on the same
+middlegame benchmark v1 scores depth 5.0 / 19.6k nps on — roughly 56x, not
+the 3-5x-below-perft (~250-500k) that was expected going in. That gap was
+investigated rather than accepted: cross-checked node counts and best
+moves against v1's own search (null-move/LMR disabled in v1, since this
+port doesn't have them yet) at fixed depths 4-7 on the same position —
+**identical scores and identical best moves at every depth**, which is
+strong evidence the algorithm's behavior was preserved exactly rather than
+numba silently over-pruning. The likely explanation: the "3-5x" heuristic
+assumes eval/ordering/TT overhead comparable to many existing engines'
+implementations; here that overhead is proportionally small relative to
+movegen (simple material+PST eval, insertion-sort ordering, direct
+array-indexed TT), so search nps lands much closer to the raw
+movegen-only rate than the heuristic predicted.
+
+**Scope not yet ported from v1**: killers, history heuristic, null-move
+pruning, LMR. Core negamax/PVS/quiescence/TT/MVV-LVA only.
+
+**Compile budget is tightening.** Cold-start (numba cache cleared, target
+30s / hard budget 60s) by stage: movegen alone 12.85s -> +Zobrist 9.8s ->
++eval 7.6s (noise, not a real improvement) -> **+search 22.16s**. Still
+under the 30s target but with less margin than is comfortable, and this
+is *before* porting killers/history/null-move/LMR, which will add more
+compiled code. Worth watching closely, possibly splitting kernels, before
+adding more.

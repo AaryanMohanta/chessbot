@@ -24,10 +24,21 @@ allocated per call, per the design doc's "never allocate per node".
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
+import numba
 from numba import njit
 
 import cb_nb_tables as T
+import cb_tables as V1_TABLES  # reuse the already-tuned v1 PST/material data
+
+# Same env-var-flag pattern as cb_nb_search.py's CB_NB_ENABLE_KILLERS_HISTORY
+# etc.: lets ratings/sprt.py A/B the *same* compiled module with the six
+# eval terms below (passed pawns, isolated/doubled pawns, rook files,
+# bishop pair, mobility, king safety) on vs off, for the batch SPRT
+# against the material+PST-only baseline.
+ENABLE_EXTENDED_EVAL = os.environ.get("CB_NB_ENABLE_EXTENDED_EVAL", "1") != "0"
 
 WHITE, BLACK = 0, 1
 PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = 0, 1, 2, 3, 4, 5
@@ -50,26 +61,127 @@ CASTLE_KING_PATH = np.array([[[4, 5, 6], [4, 3, 2]], [[60, 61, 62], [60, 59, 58]
 CASTLE_ALL_ROOK_SQUARES = np.array([0, 7, 56, 63], dtype=np.int64)
 CASTLE_ALL_ROOK_BITS = np.array([2, 1, 8, 4], dtype=np.int64)  # WQ,WK,BQ,BK
 
+# ---------------------------------------------------------------------
+# Stage 4: signed, mirrored material+PST tables, indexed [piece_idx][square]
+# (piece_idx = color*6+piece_type, same as `pieces`/`mailbox`). Folding
+# material, PST, sign (+white/-black), and black's vertical mirror into
+# one lookup makes the incremental update at each add/remove site a
+# single table read, mirroring how the Zobrist tables work in stage 3.
+# Reuses cb_tables.py's v1 PST data directly -- same a1=0..h8=63 square
+# numbering, so no reformulation needed, just re-signing for black.
+# ---------------------------------------------------------------------
+MAX_PHASE = V1_TABLES.MAX_PHASE
 
-@njit(cache=True)
+
+def _build_signed_pst():
+    pst_mg = np.zeros((12, 64), dtype=np.int64)
+    pst_eg = np.zeros((12, 64), dtype=np.int64)
+    phase_weight = np.zeros(12, dtype=np.int64)
+    piece_types = [T.PAWN, T.KNIGHT, T.BISHOP, T.ROOK, T.QUEEN, T.KING]
+    for pt in piece_types:
+        # cb_nb_tables uses 0-indexed piece types (PAWN=0..KING=5);
+        # cb_tables.py (v1, reused here for its PST/material data) keys
+        # its dicts by python-chess's own 1-indexed constants (PAWN=1..
+        # KING=6) -- +1 bridges the two conventions.
+        chess_pt = pt + 1
+        mg_val = V1_TABLES.PIECE_VALUES_MG[chess_pt]
+        eg_val = V1_TABLES.PIECE_VALUES_EG[chess_pt]
+        mg_pst = V1_TABLES.PST_MG[chess_pt]
+        eg_pst = V1_TABLES.PST_EG[chess_pt]
+        weight = V1_TABLES.PHASE_WEIGHTS[chess_pt]
+
+        white_idx = 0 * 6 + pt
+        black_idx = 1 * 6 + pt
+        phase_weight[white_idx] = weight
+        phase_weight[black_idx] = weight
+        for square in range(64):
+            pst_mg[white_idx, square] = mg_val + mg_pst[square]
+            pst_eg[white_idx, square] = eg_val + eg_pst[square]
+            mirrored = square ^ 56
+            pst_mg[black_idx, square] = -(mg_val + mg_pst[mirrored])
+            pst_eg[black_idx, square] = -(eg_val + eg_pst[mirrored])
+    return pst_mg, pst_eg, phase_weight
+
+
+PST_SIGNED_MG, PST_SIGNED_EG, PHASE_WEIGHT_BY_IDX = _build_signed_pst()
+
+# Passed-pawn bonus by relative rank (0 = own back rank, 7 = the square
+# it'd promote from -- unreachable for a pawn still on the board, kept
+# at 0 for safety). Values are a reasonable starting curve, not tuned --
+# Texel tuning is the explicit later step for refining constants like
+# these, not this one.
+PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
+PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
+
+# Lazy eval: material+PST alone is decisive often enough (a position way
+# outside the search window won't be changed by refining pawn structure/
+# mobility/king safety) that computing those terms for every leaf is
+# wasted work. If the cheap material+PST score already misses the
+# [alpha, beta] window by more than this margin, it's returned as-is.
+LAZY_EVAL_MARGIN = 250
+
+# Isolated/doubled pawn penalties -- same "starting curve, not tuned"
+# caveat as the passed-pawn bonuses above.
+ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
+DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
+
+# Rook on an open (no pawns of either colour) or semi-open (no *own*
+# pawns) file. Bigger in the middlegame, where an open file is a real
+# attacking asset; smaller in the endgame, where rook activity tends to
+# come from king/pawn proximity more than file control.
+ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
+ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
+
+# Bishop pair: two bishops covering both square colours are worth more
+# than the sum of two same-colour minor pieces, especially as the board
+# opens up in the endgame.
+BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
+
+# King safety: deliberately small weights (see _king_safety_score) --
+# Texel tuning is what finds the real values later; this only needs to
+# be present and not actively harmful. Middlegame-only (no EG term):
+# king safety matters far less once material is traded off, and kings
+# often want to be active/central in the endgame rather than sheltered.
+KING_SHIELD_PENALTY_MG = 10  # per missing pawn in the 3-square shield in front of the king
+KING_OPEN_FILE_PENALTY_MG = 15  # king's own file has no pawns of either colour
+KING_SEMI_OPEN_FILE_PENALTY_MG = 8  # king's own file has no *own* pawns (enemy pawns may be present)
+# Indexed PAWN..KING; only KNIGHT/BISHOP/ROOK/QUEEN are nonzero -- how
+# dangerous one enemy piece of this type attacking the king's immediate
+# zone is considered.
+KING_ATTACKER_WEIGHT = np.array([0, 1, 1, 2, 4, 0], dtype=np.int64)
+KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
+
+# Mobility: per-square bonus for each pseudo-legally reachable square not
+# occupied by a piece of the same colour, weighted by piece type
+# (indexed PAWN..KING; only KNIGHT/BISHOP/ROOK/QUEEN are nonzero -- pawn
+# and king "mobility" aren't meaningful the same way and aren't scored
+# here). Higher weight on knights/bishops than rooks/queens since the
+# latter naturally reach far more squares, so an equal per-square weight
+# would overweight them relative to how much any one extra square
+# actually matters.
+MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
+MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)
+
+# Rebound to plain module-level names (not accessed as T.PASSED_PAWN_MASK
+# etc.) so they resolve as njit globals the same well-established way
+# _DEBRUIJN_TABLE below does -- cross-module attribute chains aren't used
+# as njit globals anywhere else in this file, so this isn't a pattern
+# worth introducing here either.
+_PASSED_PAWN_MASK = T.PASSED_PAWN_MASK
+_FILE_MASKS = T.FILE_MASKS
+_ADJACENT_FILES_MASK = T.ADJACENT_FILES_MASK
+
+
+@njit(numba.int64(numba.int64, numba.int64, numba.int64, numba.int64), cache=False)
 def pack_move(from_sq, to_sq, promo, flag):
     return from_sq | (to_sq << 6) | (promo << 12) | (flag << 15)
-
-
-@njit(cache=True)
-def unpack_move(move):
-    from_sq = move & 0x3F
-    to_sq = (move >> 6) & 0x3F
-    promo = (move >> 12) & 0x7
-    flag = (move >> 15) & 0x7
-    return from_sq, to_sq, promo, flag
 
 
 _DEBRUIJN64 = np.uint64(0x03F79D71B4CB0A89)
 _DEBRUIJN_TABLE = np.array([0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4, 62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5, 63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11, 46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6], dtype=np.int64)
 
 
-@njit(cache=True)
+@njit(cache=False)
 def _bit_scan(bb):
     """Index of the lowest set bit, via the standard De Bruijn multiply
     (numpy uint64 scalars don't support .bit_length() under numba).
@@ -79,21 +191,21 @@ def _bit_scan(bb):
     return _DEBRUIJN_TABLE[np.int64(index)]
 
 
-@njit(cache=True)
+@njit(cache=False)
 def rook_attacks_fast(square, occupied, masks, magics, shifts, offsets, table):
     blockers = np.uint64(occupied) & masks[square]
     index = (blockers * magics[square]) >> np.uint64(shifts[square])
     return table[offsets[square] + np.int64(index)]
 
 
-@njit(cache=True)
+@njit(cache=False)
 def bishop_attacks_fast(square, occupied, masks, magics, shifts, offsets, table):
     blockers = np.uint64(occupied) & masks[square]
     index = (blockers * magics[square]) >> np.uint64(shifts[square])
     return table[offsets[square] + np.int64(index)]
 
 
-@njit(cache=True)
+@njit(numba.uint64(numba.uint64[:], numba.int64), cache=False)
 def occupied_co(pieces, color):
     occ = np.uint64(0)
     base = color * 6
@@ -102,12 +214,12 @@ def occupied_co(pieces, color):
     return occ
 
 
-@njit(cache=True)
+@njit(cache=False)
 def occupied_all(pieces):
     return occupied_co(pieces, 0) | occupied_co(pieces, 1)
 
 
-@njit(cache=True)
+@njit(cache=False)
 def is_square_attacked(pieces, square, by_color,
                         rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
@@ -131,12 +243,12 @@ def is_square_attacked(pieces, square, by_color,
     return False
 
 
-@njit(cache=True)
+@njit(cache=False)
 def king_square(pieces, color):
     return _bit_scan(pieces[color * 6 + KING])
 
 
-@njit(cache=True)
+@njit(cache=False)
 def in_check(pieces, color,
              rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
              bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
@@ -149,7 +261,7 @@ def in_check(pieces, color,
                                knight_attacks, king_attacks, pawn_attacks)
 
 
-@njit(cache=True)
+@njit(cache=False)
 def generate_pseudo_legal_moves(pieces, mailbox, meta, moves_buf,
                                  rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                  bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
@@ -281,8 +393,15 @@ def generate_pseudo_legal_moves(pieces, mailbox, meta, moves_buf,
     return count
 
 
-@njit(cache=True)
-def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, castle_all_rook_squares, castle_all_rook_bits):
+@njit(cache=False)
+def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, castle_all_rook_squares, castle_all_rook_bits,
+              zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+              eval_state, pst_mg, pst_eg, phase_weight):
+    """``zobrist`` and ``eval_state`` ([mg_score, eg_score, phase], all
+    int64) are mutable out-params (numba's array-of-length-1/3 idiom for
+    "pass by reference"). Every site that adds or removes a piece bit
+    updates both alongside the bitboard/mailbox change itself -- same
+    principle as the Zobrist XORs in stage 3, just += / -= instead of ^=."""
     from_sq = move & 0x3F
     to_sq = (move >> 6) & 0x3F
     promo = (move >> 12) & 0x7
@@ -301,6 +420,14 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     piece_type = piece_idx % 6
     push_dir = 8 if color == 0 else -8
 
+    h = zobrist[0]
+    mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
+
+    h ^= zobrist_piece[piece_idx, from_sq]
+    mg -= pst_mg[piece_idx, from_sq]
+    eg -= pst_eg[piece_idx, from_sq]
+    phase -= phase_weight[piece_idx]
+
     if flag == FLAG_EP:
         captured_square = to_sq - push_dir
         captured_idx = mailbox[captured_square]
@@ -308,12 +435,20 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
         undo_captured_square = captured_square
         pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(captured_square))
         mailbox[captured_square] = -1
+        h ^= zobrist_piece[captured_idx, captured_square]
+        mg -= pst_mg[captured_idx, captured_square]
+        eg -= pst_eg[captured_idx, captured_square]
+        phase -= phase_weight[captured_idx]
     else:
         captured_idx = mailbox[to_sq]
         if captured_idx != -1:
             undo_captured_piece = captured_idx
             undo_captured_square = to_sq
             pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(to_sq))
+            h ^= zobrist_piece[captured_idx, to_sq]
+            mg -= pst_mg[captured_idx, to_sq]
+            eg -= pst_eg[captured_idx, to_sq]
+            phase -= phase_weight[captured_idx]
 
     pieces[piece_idx] &= ~(np.uint64(1) << np.uint64(from_sq))
     final_piece_type = promo if promo != NO_PROMO else piece_type
@@ -321,6 +456,10 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     pieces[final_piece_idx] |= np.uint64(1) << np.uint64(to_sq)
     mailbox[from_sq] = -1
     mailbox[to_sq] = final_piece_idx
+    h ^= zobrist_piece[final_piece_idx, to_sq]
+    mg += pst_mg[final_piece_idx, to_sq]
+    eg += pst_eg[final_piece_idx, to_sq]
+    phase += phase_weight[final_piece_idx]
 
     if flag == FLAG_CASTLE_K or flag == FLAG_CASTLE_Q:
         side = 0 if flag == FLAG_CASTLE_K else 1
@@ -331,6 +470,11 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
         pieces[rook_idx] |= np.uint64(1) << np.uint64(rook_to)
         mailbox[rook_from] = -1
         mailbox[rook_to] = rook_idx
+        h ^= zobrist_piece[rook_idx, rook_from]
+        h ^= zobrist_piece[rook_idx, rook_to]
+        mg += pst_mg[rook_idx, rook_to] - pst_mg[rook_idx, rook_from]
+        eg += pst_eg[rook_idx, rook_to] - pst_eg[rook_idx, rook_from]
+        # phase unaffected: same rook, just relocated
 
     new_ep = -1
     if flag == FLAG_DOUBLE_PUSH:
@@ -352,17 +496,33 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     else:
         new_halfmove = meta[3] + 1
 
+    h ^= zobrist_castling[undo_castling_rights]
+    h ^= zobrist_castling[rights]
+    if undo_ep_square != -1:
+        h ^= zobrist_ep_file[undo_ep_square % 8]
+    if new_ep != -1:
+        h ^= zobrist_ep_file[new_ep % 8]
+    h ^= zobrist_side
+
     meta[0] = opponent
     meta[1] = rights
     meta[2] = new_ep
     meta[3] = new_halfmove
     meta[4] = meta[4] + (1 if color == 1 else 0)
+    zobrist[0] = h
+    eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
     return undo_castling_rights, undo_ep_square, undo_halfmove_clock, undo_captured_piece, undo_captured_square
 
 
-@njit(cache=True)
-def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_square, undo_halfmove_clock, undo_captured_piece, undo_captured_square, castle_rook_from, castle_rook_to):
+@njit(cache=False)
+def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_square, undo_halfmove_clock, undo_captured_piece, undo_captured_square, castle_rook_from, castle_rook_to,
+                zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+                eval_state, pst_mg, pst_eg, phase_weight):
+    """XOR is its own inverse, so the hash update redoes the same XOR
+    terms make_move applied. eval_state isn't self-inverse the same way
+    (+=/-= aren't involutions) -- each site below applies the exact
+    opposite sign of what make_move did there."""
     from_sq = move & 0x3F
     to_sq = (move >> 6) & 0x3F
     promo = (move >> 12) & 0x7
@@ -370,6 +530,8 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
 
     opponent = meta[0]
     color = 1 - opponent
+    current_rights = meta[1]
+    current_ep = meta[2]
 
     meta[0] = color
     meta[1] = undo_castling_rights
@@ -382,10 +544,22 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     original_piece_type = PAWN if promo != NO_PROMO else final_piece_type
     original_piece_idx = color * 6 + original_piece_type
 
+    h = zobrist[0]
+    mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
+
+    h ^= zobrist_piece[final_piece_idx, to_sq]
+    mg -= pst_mg[final_piece_idx, to_sq]
+    eg -= pst_eg[final_piece_idx, to_sq]
+    phase -= phase_weight[final_piece_idx]
+
     pieces[final_piece_idx] &= ~(np.uint64(1) << np.uint64(to_sq))
     pieces[original_piece_idx] |= np.uint64(1) << np.uint64(from_sq)
     mailbox[to_sq] = -1
     mailbox[from_sq] = original_piece_idx
+    h ^= zobrist_piece[original_piece_idx, from_sq]
+    mg += pst_mg[original_piece_idx, from_sq]
+    eg += pst_eg[original_piece_idx, from_sq]
+    phase += phase_weight[original_piece_idx]
 
     if flag == FLAG_CASTLE_K or flag == FLAG_CASTLE_Q:
         side = 0 if flag == FLAG_CASTLE_K else 1
@@ -396,19 +570,40 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
         pieces[rook_idx] |= np.uint64(1) << np.uint64(rook_from)
         mailbox[rook_to] = -1
         mailbox[rook_from] = rook_idx
+        h ^= zobrist_piece[rook_idx, rook_to]
+        h ^= zobrist_piece[rook_idx, rook_from]
+        mg += pst_mg[rook_idx, rook_from] - pst_mg[rook_idx, rook_to]
+        eg += pst_eg[rook_idx, rook_from] - pst_eg[rook_idx, rook_to]
 
     if undo_captured_piece != -1:
         pieces[undo_captured_piece] |= np.uint64(1) << np.uint64(undo_captured_square)
         mailbox[undo_captured_square] = undo_captured_piece
+        h ^= zobrist_piece[undo_captured_piece, undo_captured_square]
+        mg += pst_mg[undo_captured_piece, undo_captured_square]
+        eg += pst_eg[undo_captured_piece, undo_captured_square]
+        phase += phase_weight[undo_captured_piece]
+
+    h ^= zobrist_castling[current_rights]
+    h ^= zobrist_castling[undo_castling_rights]
+    if current_ep != -1:
+        h ^= zobrist_ep_file[current_ep % 8]
+    if undo_ep_square != -1:
+        h ^= zobrist_ep_file[undo_ep_square % 8]
+    h ^= zobrist_side
+
+    zobrist[0] = h
+    eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
 
-@njit(cache=True)
+@njit(cache=False)
 def perft(pieces, mailbox, meta, depth, moves_buf_stack, stack_ptr,
           rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
           bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
           knight_attacks, king_attacks, pawn_attacks,
           castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
-          castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits):
+          castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
+          zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+          eval_state, pst_mg, pst_eg, phase_weight):
     if depth == 0:
         return 1
 
@@ -424,7 +619,9 @@ def perft(pieces, mailbox, meta, depth, moves_buf_stack, stack_ptr,
     nodes = 0
     for i in range(count):
         move = moves_buf[i]
-        undo = make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, castle_all_rook_squares, castle_all_rook_bits)
+        undo = make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, castle_all_rook_squares, castle_all_rook_bits,
+                          zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+                          eval_state, pst_mg, pst_eg, phase_weight)
         if not in_check(pieces, color,
                          rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                          bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
@@ -434,8 +631,12 @@ def perft(pieces, mailbox, meta, depth, moves_buf_stack, stack_ptr,
                            bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                            knight_attacks, king_attacks, pawn_attacks,
                            castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
-                           castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits)
-        unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to)
+                           castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
+                           zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+                           eval_state, pst_mg, pst_eg, phase_weight)
+        unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
+                    zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
+                    eval_state, pst_mg, pst_eg, phase_weight)
 
     return nodes
 
@@ -446,6 +647,19 @@ def perft(pieces, mailbox, meta, depth, moves_buf_stack, stack_ptr,
 # ---------------------------------------------------------------------
 
 PIECE_CHARS = "pnbrqk"
+_PROMO_LETTER = {KNIGHT: "n", BISHOP: "b", ROOK: "r", QUEEN: "q"}
+
+
+def move_to_uci(move: int) -> str:
+    """Packed int32 move -> UCI string (e.g. "e2e4", "e7e8q")."""
+    from_sq = move & 0x3F
+    to_sq = (move >> 6) & 0x3F
+    promo = (move >> 12) & 0x7
+    files = "abcdefgh"
+    uci = f"{files[from_sq % 8]}{from_sq // 8 + 1}{files[to_sq % 8]}{to_sq // 8 + 1}"
+    if promo != NO_PROMO:
+        uci += _PROMO_LETTER[promo]
+    return uci
 
 
 def fen_to_state(fen: str):
@@ -559,14 +773,415 @@ class Tables:
         self.castle_king_path = CASTLE_KING_PATH
         self.castle_all_rook_squares = CASTLE_ALL_ROOK_SQUARES
         self.castle_all_rook_bits = CASTLE_ALL_ROOK_BITS
+        self.zobrist_piece = T.ZOBRIST_PIECE.reshape(12, 64)  # [color*6+piece_type, square]
+        self.zobrist_castling = T.ZOBRIST_CASTLING
+        self.zobrist_ep_file = T.ZOBRIST_EP_FILE
+        self.zobrist_side = T.ZOBRIST_SIDE
+        self.pst_mg = PST_SIGNED_MG
+        self.pst_eg = PST_SIGNED_EG
+        self.phase_weight = PHASE_WEIGHT_BY_IDX
 
 
 _TABLES = Tables()
 
 
+@njit(cache=False)
+def zobrist_hash_from_scratch(pieces, meta, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side):
+    h = np.uint64(0)
+    for idx in range(12):
+        bb = pieces[idx]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            h ^= zobrist_piece[idx, square]
+    h ^= zobrist_castling[meta[1]]
+    if meta[2] != -1:
+        h ^= zobrist_ep_file[meta[2] % 8]
+    if meta[0] == 1:
+        h ^= zobrist_side
+    return h
+
+
+def compute_hash(pieces, meta) -> int:
+    t = _TABLES
+    return int(zobrist_hash_from_scratch(pieces, meta, t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side))
+
+
+@njit(cache=False)
+def eval_state_from_scratch(pieces, pst_mg, pst_eg, phase_weight):
+    mg = np.int64(0)
+    eg = np.int64(0)
+    phase = np.int64(0)
+    for idx in range(12):
+        bb = pieces[idx]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            mg += pst_mg[idx, square]
+            eg += pst_eg[idx, square]
+            phase += phase_weight[idx]
+    return mg, eg, phase
+
+
+def compute_eval_state(pieces) -> tuple:
+    t = _TABLES
+    mg, eg, phase = eval_state_from_scratch(pieces, t.pst_mg, t.pst_eg, t.phase_weight)
+    return int(mg), int(eg), int(phase)
+
+
+@njit(cache=False)
+def _popcount(bb):
+    """Number of set bits. numba doesn't support uint64.bit_count()
+    (same gap that made _bit_scan below need a manual De Bruijn multiply
+    instead of .bit_length()) -- pawns-per-file is at most a handful, so
+    a clear-the-lowest-bit loop is plenty fast without needing an O(1)
+    SWAR trick."""
+    count = 0
+    while bb != np.uint64(0):
+        count += 1
+        bb &= bb - np.uint64(1)
+    return count
+
+
+@njit(cache=False)
+def _pawn_structure_score(pieces):
+    """White-minus-black (mg, eg) isolated/doubled pawn penalties.
+    Doubled: a penalty per pawn beyond the first on a file. Isolated: no
+    friendly pawn on either adjacent file, checked once per occupied
+    file (every pawn on that file shares the same verdict). Like passed
+    pawns, computed fresh from the piece bitboards at eval time rather
+    than maintained incrementally."""
+    mg = 0
+    eg = 0
+    for color in (0, 1):
+        pawns = pieces[color * 6 + PAWN]
+        for file in range(8):
+            count = _popcount(pawns & _FILE_MASKS[file])
+            if count == 0:
+                continue
+            penalty_mg = 0
+            penalty_eg = 0
+            if count > 1:
+                penalty_mg += DOUBLED_PENALTY_MG * (count - 1)
+                penalty_eg += DOUBLED_PENALTY_EG * (count - 1)
+            if (pawns & _ADJACENT_FILES_MASK[file]) == np.uint64(0):
+                penalty_mg += ISOLATED_PENALTY_MG
+                penalty_eg += ISOLATED_PENALTY_EG
+            if color == 0:
+                mg -= penalty_mg
+                eg -= penalty_eg
+            else:
+                mg += penalty_mg
+                eg += penalty_eg
+    return mg, eg
+
+
+@njit(cache=False)
+def _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                     bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                     knight_attacks):
+    """White-minus-black (mg, eg) mobility bonus for knights/bishops/
+    rooks/queens: a small per-piece-type-weighted bonus per pseudo-
+    legally reachable square not occupied by a piece of the same colour.
+    Pseudo-legal on purpose (doesn't check whether a move would leave
+    the king in check) -- this is a positional heuristic evaluated at
+    every leaf, not a legality check, and full legality filtering here
+    would cost far more than the term is worth. King mobility isn't
+    scored here (folded into king safety instead, when that term
+    lands)."""
+    mg = 0
+    eg = 0
+    occ = occupied_all(pieces)
+    for color in (0, 1):
+        not_own = ~occupied_co(pieces, color)
+        term_mg = 0
+        term_eg = 0
+
+        bb = pieces[color * 6 + KNIGHT]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            n = _popcount(knight_attacks[square] & not_own)
+            term_mg += n * MOBILITY_UNIT_MG[KNIGHT]
+            term_eg += n * MOBILITY_UNIT_EG[KNIGHT]
+
+        bb = pieces[color * 6 + BISHOP]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            attacks = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+            n = _popcount(attacks & not_own)
+            term_mg += n * MOBILITY_UNIT_MG[BISHOP]
+            term_eg += n * MOBILITY_UNIT_EG[BISHOP]
+
+        bb = pieces[color * 6 + ROOK]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            attacks = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+            n = _popcount(attacks & not_own)
+            term_mg += n * MOBILITY_UNIT_MG[ROOK]
+            term_eg += n * MOBILITY_UNIT_EG[ROOK]
+
+        bb = pieces[color * 6 + QUEEN]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            r_attacks = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+            b_attacks = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+            n = _popcount((r_attacks | b_attacks) & not_own)
+            term_mg += n * MOBILITY_UNIT_MG[QUEEN]
+            term_eg += n * MOBILITY_UNIT_EG[QUEEN]
+
+        if color == 0:
+            mg += term_mg
+            eg += term_eg
+        else:
+            mg -= term_mg
+            eg -= term_eg
+    return mg, eg
+
+
+@njit(cache=False)
+def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                        bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                        knight_attacks, king_attacks):
+    """White-minus-black middlegame-only king safety penalty (see the
+    KING_* constants above for why the weights are deliberately small):
+
+      - pawn shield: the 3 squares one rank in front of the king (its own
+        file and the two adjacent ones) -- a penalty per missing pawn.
+      - king's own file open (no pawns of either colour) or semi-open
+        (no *own* pawns) -- undefended by a friendly pawn wall.
+      - enemy knights/bishops/rooks/queens that pseudo-legally attack any
+        square in the king's immediate zone (its square + 8 neighbours,
+        via king_attacks -- reused as a "zone" mask, not a legal-king-
+        move check), weighted by piece type.
+
+    Reuses mobility's exact same attack-table parameters (already
+    threaded through evaluate_from_state), so this adds no new plumbing
+    beyond king_attacks itself."""
+    mg = 0
+    occ = occupied_all(pieces)
+    for color in (0, 1):
+        enemy = 1 - color
+        king_sq = _bit_scan(pieces[color * 6 + KING])
+        king_rank, king_file = divmod(king_sq, 8)
+        own_pawns = pieces[color * 6 + PAWN]
+        enemy_pawns = pieces[enemy * 6 + PAWN]
+        penalty = 0
+
+        shield_rank = king_rank + 1 if color == 0 else king_rank - 1
+        if 0 <= shield_rank < 8:
+            for f in (king_file - 1, king_file, king_file + 1):
+                if 0 <= f < 8:
+                    shield_sq = shield_rank * 8 + f
+                    if (own_pawns & (np.uint64(1) << np.uint64(shield_sq))) == np.uint64(0):
+                        penalty += KING_SHIELD_PENALTY_MG
+
+        king_file_mask = _FILE_MASKS[king_file]
+        if (own_pawns & king_file_mask) == np.uint64(0):
+            if (enemy_pawns & king_file_mask) == np.uint64(0):
+                penalty += KING_OPEN_FILE_PENALTY_MG
+            else:
+                penalty += KING_SEMI_OPEN_FILE_PENALTY_MG
+
+        zone = king_attacks[king_sq]
+        attacker_weight = 0
+
+        bb = pieces[enemy * 6 + KNIGHT]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            if (knight_attacks[square] & zone) != np.uint64(0):
+                attacker_weight += KING_ATTACKER_WEIGHT[KNIGHT]
+
+        bb = pieces[enemy * 6 + BISHOP]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            attacks = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+            if (attacks & zone) != np.uint64(0):
+                attacker_weight += KING_ATTACKER_WEIGHT[BISHOP]
+
+        bb = pieces[enemy * 6 + ROOK]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            attacks = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+            if (attacks & zone) != np.uint64(0):
+                attacker_weight += KING_ATTACKER_WEIGHT[ROOK]
+
+        bb = pieces[enemy * 6 + QUEEN]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            r_attacks = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+            b_attacks = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+            if ((r_attacks | b_attacks) & zone) != np.uint64(0):
+                attacker_weight += KING_ATTACKER_WEIGHT[QUEEN]
+
+        penalty += attacker_weight * KING_ATTACKER_PENALTY_PER_UNIT_MG
+
+        if color == 0:
+            mg -= penalty
+        else:
+            mg += penalty
+    return mg
+
+
+@njit(cache=False)
+def _bishop_pair_score(pieces):
+    """White-minus-black (mg, eg) bonus for having both bishops. Just a
+    popcount check on the bishop bitboard per side -- no need for the
+    per-piece bit-scan loop the other terms use."""
+    mg = 0
+    eg = 0
+    white_bishops = _popcount(pieces[0 * 6 + BISHOP])
+    black_bishops = _popcount(pieces[1 * 6 + BISHOP])
+    if white_bishops >= 2:
+        mg += BISHOP_PAIR_BONUS_MG
+        eg += BISHOP_PAIR_BONUS_EG
+    if black_bishops >= 2:
+        mg -= BISHOP_PAIR_BONUS_MG
+        eg -= BISHOP_PAIR_BONUS_EG
+    return mg, eg
+
+
+@njit(cache=False)
+def _rook_file_score(pieces):
+    """White-minus-black (mg, eg) bonus for rooks on open/semi-open
+    files. Computed fresh at eval time like the other pawn-structure-
+    dependent terms above -- "are there pawns of either colour on this
+    file" isn't something a rook's own make_move/unmake_move touches."""
+    mg = 0
+    eg = 0
+    for color in (0, 1):
+        enemy = 1 - color
+        own_pawns = pieces[color * 6 + PAWN]
+        enemy_pawns = pieces[enemy * 6 + PAWN]
+        rooks = pieces[color * 6 + ROOK]
+        bb = rooks
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            file_mask = _FILE_MASKS[square % 8]
+            has_own = (own_pawns & file_mask) != np.uint64(0)
+            has_enemy = (enemy_pawns & file_mask) != np.uint64(0)
+            if has_own:
+                continue  # own pawn on the file -- neither open nor semi-open
+            bonus_mg = ROOK_OPEN_FILE_BONUS_MG if not has_enemy else ROOK_SEMI_OPEN_FILE_BONUS_MG
+            bonus_eg = ROOK_OPEN_FILE_BONUS_EG if not has_enemy else ROOK_SEMI_OPEN_FILE_BONUS_EG
+            if color == 0:
+                mg += bonus_mg
+                eg += bonus_eg
+            else:
+                mg -= bonus_mg
+                eg -= bonus_eg
+    return mg, eg
+
+
+@njit(cache=False)
+def _passed_pawn_score(pieces):
+    """White-minus-black (mg, eg) passed-pawn bonus. Unlike material/PST,
+    this isn't maintained incrementally through make_move/unmake_move --
+    "is this pawn's file-triple clear of enemy pawns" doesn't decompose
+    into a simple per-move delta the way a piece landing on/leaving a
+    square does, so it's recomputed from the piece bitboards at every
+    leaf eval instead (cheap: a handful of pawns, one mask-and-compare
+    each)."""
+    mg = 0
+    eg = 0
+    for color in (0, 1):
+        enemy = 1 - color
+        own_pawns = pieces[color * 6 + PAWN]
+        enemy_pawns = pieces[enemy * 6 + PAWN]
+        bb = own_pawns
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            mask = _PASSED_PAWN_MASK[color, square]
+            if (enemy_pawns & mask) == np.uint64(0):
+                rank = square // 8
+                rel_rank = rank if color == 0 else 7 - rank
+                if color == 0:
+                    mg += PASSED_PAWN_BONUS_MG[rel_rank]
+                    eg += PASSED_PAWN_BONUS_EG[rel_rank]
+                else:
+                    mg -= PASSED_PAWN_BONUS_MG[rel_rank]
+                    eg -= PASSED_PAWN_BONUS_EG[rel_rank]
+    return mg, eg
+
+
+@njit(cache=False)
+def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
+                         rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                         knight_attacks, king_attacks):
+    """Tapered score from ``turn``'s perspective, design doc §6 formula --
+    same tapering as v1's cb_eval.py, just reading incrementally
+    maintained material+PST totals instead of rescanning the board, plus
+    the (non-incremental) pawn-structure/mobility/king-safety terms
+    computed fresh here. Takes the magic-bitboard attack tables (needed
+    for mobility's and king safety's bishop/rook/queen attacks) because
+    numba njit functions in this codebase take flat array parameters
+    rather than a bundled object -- same reason root_search/quiescence/
+    etc. all have long parameter lists instead of taking one Tables
+    instance.
+
+    Lazy eval: material+PST alone (the cheap, incrementally-maintained
+    part) is computed first. If it already misses the caller's
+    [alpha, beta] search window by more than LAZY_EVAL_MARGIN, the
+    position is decided either way and it's returned as-is -- refining
+    it with pawn structure/mobility/etc. wouldn't change what the search
+    does with it, so that work (magic-bitboard mobility lookups
+    especially) is skipped for the (majority of) leaves where it can't
+    matter. alpha/beta are in ``turn``'s perspective, matching every
+    other alpha/beta in this search (negamax convention).
+
+    ENABLE_EXTENDED_EVAL (CB_NB_ENABLE_EXTENDED_EVAL) turns all six terms
+    off at once, always returning the material+PST score -- for the
+    batch SPRT of "all six terms" against the material+PST-only
+    baseline, not per-term (a per-term SPRT was rejected: six separate
+    attribution runs when only the batched accept/reject decision will
+    actually be acted on)."""
+    mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
+    phase = min(phase, MAX_PHASE)
+    phase_256 = (phase * 256) // MAX_PHASE
+
+    lazy_score = (mg * phase_256 + eg * (256 - phase_256)) // 256
+    lazy_score = lazy_score if turn == 0 else -lazy_score
+    if not ENABLE_EXTENDED_EVAL:
+        return lazy_score
+    if lazy_score < alpha - LAZY_EVAL_MARGIN or lazy_score > beta + LAZY_EVAL_MARGIN:
+        return lazy_score
+
+    pp_mg, pp_eg = _passed_pawn_score(pieces)
+    ps_mg, ps_eg = _pawn_structure_score(pieces)
+    rf_mg, rf_eg = _rook_file_score(pieces)
+    bp_mg, bp_eg = _bishop_pair_score(pieces)
+    mob_mg, mob_eg = _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                                      bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                                      knight_attacks)
+    ks_mg = _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                                bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                                knight_attacks, king_attacks)
+    mg += pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg
+    eg += pp_eg + ps_eg + rf_eg + bp_eg + mob_eg
+    score = (mg * phase_256 + eg * (256 - phase_256)) // 256
+    return score if turn == 0 else -score
+
+
+def new_eval_state(pieces):
+    mg, eg, phase = compute_eval_state(pieces)
+    return np.array([mg, eg, phase], dtype=np.int64)
+
+
 def run_perft(fen: str, depth: int) -> int:
     pieces, mailbox, meta = fen_to_state(fen)
     moves_buf_stack = np.zeros((depth + 1, MAX_MOVES), dtype=np.int64)
+    zobrist = np.zeros(1, dtype=np.uint64)  # perft doesn't use the hash/eval; just needs to satisfy make_move's signature
+    eval_state = new_eval_state(pieces)
     t = _TABLES
     return perft(
         pieces, mailbox, meta, depth, moves_buf_stack, 0,
@@ -575,4 +1190,53 @@ def run_perft(fen: str, depth: int) -> int:
         t.knight_attacks, t.king_attacks, t.pawn_attacks,
         t.castle_king_to, t.castle_rook_from, t.castle_rook_to, t.castle_right_bit,
         t.castle_empty_squares, t.castle_king_path, t.castle_all_rook_squares, t.castle_all_rook_bits,
+        zobrist, t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side,
+        eval_state, t.pst_mg, t.pst_eg, t.phase_weight,
     )
+
+
+def make_move_simple(pieces, mailbox, meta, move, zobrist, eval_state):
+    """Convenience wrapper binding the constant tables, for debug-mode
+    verification and future search code that doesn't want to thread all
+    the table arguments through by hand."""
+    t = _TABLES
+    return make_move(pieces, mailbox, meta, move, t.castle_rook_from, t.castle_rook_to, t.castle_all_rook_squares, t.castle_all_rook_bits,
+                      zobrist, t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side,
+                      eval_state, t.pst_mg, t.pst_eg, t.phase_weight)
+
+
+def unmake_move_simple(pieces, mailbox, meta, move, undo, zobrist, eval_state):
+    t = _TABLES
+    unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], t.castle_rook_from, t.castle_rook_to,
+                zobrist, t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side,
+                eval_state, t.pst_mg, t.pst_eg, t.phase_weight)
+
+
+def generate_legal_moves_simple(pieces, mailbox, meta):
+    """Full legal-move generation (pseudo-legal + king-safety filter),
+    tables bound. For debug/verification harnesses, not the search hot
+    path (which should stay inlined in njit -- see stage 5)."""
+    t = _TABLES
+    moves_buf = np.zeros(MAX_MOVES, dtype=np.int64)
+    count = generate_pseudo_legal_moves(
+        pieces, mailbox, meta, moves_buf,
+        t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+        t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
+        t.castle_king_to, t.castle_rook_from, t.castle_right_bit,
+        t.castle_empty_squares, t.castle_king_path,
+    )
+    color = meta[0]
+    legal = []
+    zobrist_scratch = np.zeros(1, dtype=np.uint64)
+    eval_scratch = new_eval_state(pieces)
+    for i in range(count):
+        move = int(moves_buf[i])
+        undo = make_move_simple(pieces, mailbox, meta, move, zobrist_scratch, eval_scratch)
+        if not in_check(pieces, color,
+                         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+                         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
+                         t.knight_attacks, t.king_attacks, t.pawn_attacks):
+            legal.append(move)
+        unmake_move_simple(pieces, mailbox, meta, move, undo, zobrist_scratch, eval_scratch)
+    return legal
