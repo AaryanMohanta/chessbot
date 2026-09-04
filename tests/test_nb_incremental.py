@@ -85,7 +85,7 @@ def _eval_full(pieces, meta):
     full-terms path (not the lazy material+PST-only shortcut)."""
     t = f._TABLES
     return f.evaluate_from_state(
-        f.new_eval_state(pieces), meta[0], pieces, -_WIDE_WINDOW, _WIDE_WINDOW,
+        f.new_eval_state(pieces), meta[0], pieces, meta[1], -_WIDE_WINDOW, _WIDE_WINDOW,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
@@ -102,12 +102,24 @@ def test_passed_pawn_score_matches_hand_count():
     d/e/f files are all empty of black pawns -> passed, relative rank 3.
     Black pawn a7: 0-indexed rank 6, "ahead" (towards rank 0) on a/b
     files (no c-1 file) are all empty of white pawns -> passed, relative
-    rank 7-6=1."""
+    rank 7-6=1.
+
+    Kings are e1/e8 (from _ONE_PAWN_EACH_FEN), so the EG-only king-to-
+    passed-pawn-race term (2026-09) is also nonzero here and hand-
+    computed too, via Chebyshev distance to each pawn's promotion
+    square: white's pawn promotes on e8 (dist: white king e1->e8 is 7,
+    black king e8->e8 is 0); black's pawn promotes on a1 (dist: black
+    king e8->a1 is 7, white king e1->a1 is 4)."""
     pieces, mailbox, meta = f.fen_to_state(_ONE_PAWN_EACH_FEN)
 
     mg, eg = f._passed_pawn_score(pieces)
     expected_mg = f.PASSED_PAWN_BONUS_MG[3] - f.PASSED_PAWN_BONUS_MG[1]
-    expected_eg = f.PASSED_PAWN_BONUS_EG[3] - f.PASSED_PAWN_BONUS_EG[1]
+    white_king_bonus_eg = f.KING_PAWN_PROXIMITY_WEIGHT_EG * (0 - 7)  # enemy(black,e8) - own(white,e1) dist to e8
+    black_king_bonus_eg = f.KING_PAWN_PROXIMITY_WEIGHT_EG * (4 - 7)  # enemy(white,e1) - own(black,e8) dist to a1
+    expected_eg = (
+        (f.PASSED_PAWN_BONUS_EG[3] + white_king_bonus_eg)
+        - (f.PASSED_PAWN_BONUS_EG[1] + black_king_bonus_eg)
+    )
     assert (mg, eg) == (expected_mg, expected_eg)
 
 
@@ -204,17 +216,23 @@ def test_rook_behind_own_pawn_gets_no_bonus():
     assert (mg, eg) == (0, 0)
 
 
-_KS_BASELINE_FEN = "1k6/ppp5/8/8/8/8/5PPP/6K1 w - - 0 1"
+_KS_BASELINE_FEN = "1k6/ppp5/8/8/8/8/5PPP/6K1 w KQkq - 0 1"
 # White king g1 with full f2/g2/h2 shield; black king b8 with full
 # a7/b7/c7 shield -- files g and b never overlap, so each side's terms
 # can be tested by perturbing only that side without touching the
-# other's shield/file/attacker status.
+# other's shield/file/attacker status. Castling rights are set (despite
+# the kings already being off e1/e8) purely to keep the new castling
+# bonus/penalty term inert for these tests -- fen_to_state reads the
+# castling field literally, independent of king/rook placement, so this
+# is a legitimate way to isolate the shield/file/attacker terms this
+# block is actually testing. See test_castling_bonus_and_uncastled_
+# exposure_penalty below for that term's own dedicated tests.
 
 
-def _king_safety(pieces):
+def _king_safety(pieces, castling_rights):
     t = f._TABLES
     return f._king_safety_score(
-        pieces, t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+        pieces, castling_rights, t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
     )
@@ -222,16 +240,18 @@ def _king_safety(pieces):
 
 def test_king_safety_zero_when_both_kings_are_safe():
     pieces, mailbox, meta = f.fen_to_state(_KS_BASELINE_FEN)
-    assert _king_safety(pieces) == 0
+    assert _king_safety(pieces, meta[1]) == 0
 
 
 def test_king_shield_penalty_alone():
     """White's f2 pawn removed (g2 kept, so the king's own file still has
     an own pawn and no file penalty triggers) -- isolates one missing
-    shield pawn from the file term."""
-    fen = "1k6/ppp5/8/8/8/8/6PP/6K1 w - - 0 1"
+    shield pawn from the file term. No enemy queen/rook on the board, so
+    the material-scaled part of the shield penalty is zero here (see
+    test_king_shield_penalty_scales_with_enemy_attacking_material)."""
+    fen = "1k6/ppp5/8/8/8/8/6PP/6K1 w KQkq - 0 1"
     pieces, mailbox, meta = f.fen_to_state(fen)
-    assert _king_safety(pieces) == -f.KING_SHIELD_PENALTY_MG
+    assert _king_safety(pieces, meta[1]) == -f.KING_SHIELD_PENALTY_MG
 
 
 def test_king_open_file_penalty_includes_the_shared_shield_square():
@@ -242,10 +262,10 @@ def test_king_open_file_penalty_includes_the_shared_shield_square():
     is both terms together, not the file term alone -- that overlap is
     structural (removing the king's own-file pawn can't help but affect
     both checks), not a test looseness."""
-    fen = "1k6/ppp5/8/8/8/8/5P1P/6K1 w - - 0 1"
+    fen = "1k6/ppp5/8/8/8/8/5P1P/6K1 w KQkq - 0 1"
     pieces, mailbox, meta = f.fen_to_state(fen)
     expected = -(f.KING_SHIELD_PENALTY_MG + f.KING_OPEN_FILE_PENALTY_MG)
-    assert _king_safety(pieces) == expected
+    assert _king_safety(pieces, meta[1]) == expected
 
 
 def test_king_semi_open_file_penalty():
@@ -253,20 +273,89 @@ def test_king_semi_open_file_penalty():
     semi-open (enemy pawn present) instead of fully open. The stray g7
     pawn doesn't touch black's own shield/file checks (black's king is
     on b8)."""
-    fen = "1k6/ppp3p1/8/8/8/8/5P1P/6K1 w - - 0 1"
+    fen = "1k6/ppp3p1/8/8/8/8/5P1P/6K1 w KQkq - 0 1"
     pieces, mailbox, meta = f.fen_to_state(fen)
     expected = -(f.KING_SHIELD_PENALTY_MG + f.KING_SEMI_OPEN_FILE_PENALTY_MG)
-    assert _king_safety(pieces) == expected
+    assert _king_safety(pieces, meta[1]) == expected
 
 
 def test_king_attacker_penalty_alone():
     """Black rook on g6 attacks down the g-file into g2, which is inside
     white king's zone (king_attacks[g1] = f1/h1/f2/g2/h2) -- everything
-    else stays at the safe baseline, isolating the attacker term."""
-    fen = "1k6/ppp5/6r1/8/8/8/5PPP/6K1 w - - 0 1"
+    else stays at the safe baseline, isolating the attacker term. The
+    rook also counts as attacking material for the shield-scaling term,
+    but there's no missing shield pawn here for that to multiply against."""
+    fen = "1k6/ppp5/6r1/8/8/8/5PPP/6K1 w KQkq - 0 1"
     pieces, mailbox, meta = f.fen_to_state(fen)
     expected = -(f.KING_ATTACKER_WEIGHT[f.ROOK] * f.KING_ATTACKER_PENALTY_PER_UNIT_MG)
-    assert _king_safety(pieces) == expected
+    assert _king_safety(pieces, meta[1]) == expected
+
+
+def test_king_pawn_race_favours_the_closer_king():
+    """Classic king-and-pawn-race shape: a lone white a-pawn on a5
+    (passed), white king far away on h1, black king much closer on c6.
+    Black's king is closer to the promotion square (a8) than white's,
+    so the EG term should favour BLACK here despite it being white's
+    passed pawn -- the term cares about the race, not whose pawn it is.
+    White king h1->a8: Chebyshev distance 7. Black king c6->a8: distance
+    2. bonus = WEIGHT * (7 - 2), and since it's white's pawn being
+    raced, that bonus applies with a NEGATIVE sign to white's total (the
+    pawn's own side is doing badly in this particular race)."""
+    fen = "8/8/2k5/P7/8/8/8/7K w - - 0 1"
+    pieces, mailbox, meta = f.fen_to_state(fen)
+    pp_mg, pp_eg = f._passed_pawn_score(pieces)
+    expected_eg = f.PASSED_PAWN_BONUS_EG[4] + f.KING_PAWN_PROXIMITY_WEIGHT_EG * (2 - 7)
+    assert pp_eg == expected_eg
+    assert pp_eg < f.PASSED_PAWN_BONUS_EG[4]  # confirms the king term actively hurts white here
+
+
+def test_king_shield_penalty_scales_with_enemy_attacking_material():
+    """Same missing f2 shield pawn as test_king_shield_penalty_alone, but
+    with a black rook added on g6 -- attacking material present, so the
+    shield penalty must include the material-scaled bonus on top of the
+    base per-pawn penalty (and the rook's own attacker-zone penalty,
+    since g6-rook also attacks into g1's zone here)."""
+    fen = "1k6/ppp5/6r1/8/8/8/6PP/6K1 w KQkq - 0 1"
+    pieces, mailbox, meta = f.fen_to_state(fen)
+    shield = f.KING_SHIELD_PENALTY_MG + f.KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG * f.ATTACKING_MATERIAL_ROOK_UNITS
+    attacker = f.KING_ATTACKER_WEIGHT[f.ROOK] * f.KING_ATTACKER_PENALTY_PER_UNIT_MG
+    assert _king_safety(pieces, meta[1]) == -(shield + attacker)
+
+
+_CASTLED_SAFE_FEN = "4k3/3ppp2/8/8/8/8/5PPP/6K1 w k - 0 1"
+# White king g1, full f2/g2/h2 shield, no rights left (a completed
+# kingside castle); black king e8, full d7/e7/f7 shield, kingside rights
+# still held (so black's castling term stays inert) and no pieces that
+# could attack into white's zone -- isolates the castled bonus from
+# every other king-safety term.
+
+
+def test_castling_bonus_for_castled_king():
+    pieces, mailbox, meta = f.fen_to_state(_CASTLED_SAFE_FEN)
+    assert _king_safety(pieces, meta[1]) == f.CASTLED_BONUS_MG
+
+
+def test_uncastled_exposed_penalty_requires_enemy_attacking_material():
+    """White's king has wandered to e2 (not a castled square) and lost
+    all rights, with a full pawn shield around it (isolating this term
+    from the shield/file terms) and black's rook still on the board, far
+    from e2's zone -- exactly the round-4 pattern this term exists for:
+    a central, rights-less king while the opponent retains real
+    attacking material. Black keeps full rights and a home-square,
+    fully-shielded king, so only white's exposure penalty is nonzero."""
+    fen = "4k2r/3ppp2/8/8/8/3PPP2/4K3/8 w kq - 0 1"
+    pieces, mailbox, meta = f.fen_to_state(fen)
+    assert _king_safety(pieces, meta[1]) == -f.UNCASTLED_EXPOSED_PENALTY_MG
+
+
+def test_uncastled_king_with_no_enemy_major_pieces_is_not_penalised():
+    """Same wandered, rights-less, fully-shielded white king as above,
+    but black has no queen or rook left -- the exposure penalty must not
+    fire (an uncastled king in a queenless, rookless endgame is normal,
+    not unsafe)."""
+    fen = "4k3/3ppp2/8/8/8/3PPP2/4K3/8 w - - 0 1"
+    pieces, mailbox, meta = f.fen_to_state(fen)
+    assert _king_safety(pieces, meta[1]) == 0
 
 
 def test_evaluate_from_state_matches_v1_plus_pawn_structure_terms():
@@ -287,7 +376,7 @@ def test_evaluate_from_state_matches_v1_plus_pawn_structure_terms():
     # Wide alpha/beta so the lazy short-circuit (tested separately below)
     # never fires here -- this test is specifically about the full path.
     got = f.evaluate_from_state(
-        eval_state, meta[0], pieces, -_WIDE_WINDOW, _WIDE_WINDOW,
+        eval_state, meta[0], pieces, meta[1], -_WIDE_WINDOW, _WIDE_WINDOW,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
@@ -303,7 +392,7 @@ def test_evaluate_from_state_matches_v1_plus_pawn_structure_terms():
         t.knight_attacks,
     )  # zero here too (no knights/bishops/rooks/queens), same reason
     ks_mg = f._king_safety_score(
-        pieces, t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+        pieces, meta[1], t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
     )  # nonzero: both kings have a broken "shield" and sit on open files here
@@ -344,7 +433,7 @@ def test_lazy_eval_short_circuits_outside_the_window():
     alpha = beta = material_pst_only - 10_000
     t = f._TABLES
     got = f.evaluate_from_state(
-        eval_state, meta[0], pieces, alpha, beta,
+        eval_state, meta[0], pieces, meta[1], alpha, beta,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
@@ -367,7 +456,7 @@ def test_lazy_eval_margin_boundary_does_not_short_circuit():
     alpha = beta - 1000
     t = f._TABLES
     got = f.evaluate_from_state(
-        eval_state, meta[0], pieces, alpha, beta,
+        eval_state, meta[0], pieces, meta[1], alpha, beta,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,

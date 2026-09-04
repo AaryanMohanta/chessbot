@@ -117,7 +117,7 @@ class Engine:
         # sub-function it calls (mobility, etc.) gets compiled too, not
         # just the material+PST fast path.
         F.evaluate_from_state(
-            eval_state, meta[0], pieces, -1_000_000, 1_000_000,
+            eval_state, meta[0], pieces, meta[1], -1_000_000, 1_000_000,
             t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
             t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
             t.knight_attacks, t.king_attacks,

@@ -34,6 +34,31 @@ def test_falls_back_when_engine_raises(monkeypatch):
     assert chess.Move.from_uci(move) in board.legal_moves
 
 
+def test_engine_failure_is_logged_to_stderr(monkeypatch, capsys):
+    """A real ladder loss (round 11) showed the engine silently playing
+    the trivial first-legal-move fallback for an entire game with
+    nothing written to stderr -- there was no way to tell v1 and numba
+    had both failed, or why. Every fallback layer must log its own
+    exception to stderr now, exactly once per layer per process (not
+    once per move -- see _logged_move_failures)."""
+    monkeypatch.setattr(agent, "_logged_move_failures", set())
+
+    class ExplodingEngine:
+        def get_move(self, fen, time_left_ms):
+            raise RuntimeError("deliberate failure for the logging test")
+
+    monkeypatch.setattr(agent, "_engine", ExplodingEngine())
+    monkeypatch.setattr(agent, "_v1", None)  # isolate the numba layer's failure specifically
+
+    agent.get_move(chess.STARTING_FEN, 5_000)
+
+    captured = capsys.readouterr()
+    assert "cb_nb_engine" in captured.err
+    assert "RuntimeError" in captured.err
+    assert "deliberate failure for the logging test" in captured.err
+    assert captured.out == ""  # must never pollute stdout -- that's the wire protocol channel
+
+
 def test_falls_back_when_engine_returns_illegal_move(monkeypatch):
     class LyingEngine:
         def get_move(self, fen, time_left_ms):

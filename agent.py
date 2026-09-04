@@ -32,7 +32,9 @@ the next one instead of crashing the process.
 """
 from __future__ import annotations
 
+import sys
 import time
+import traceback
 
 _PROCESS_START = time.monotonic()  # first line, before any other import --
 # cb_nb_engine's compile deadline is measured from here, not from when its
@@ -41,9 +43,28 @@ _PROCESS_START = time.monotonic()  # first line, before any other import --
 
 import chess
 
+
+def _log_layer_failure(layer_name: str) -> None:
+    """Every fallback layer below silently swallows its own exception on
+    purpose (a crash mid-game is an unrecoverable loss, a degraded layer
+    is not) -- but "silent" used to mean genuinely invisible, with
+    nothing printed anywhere. A real ladder loss (round 11) showed the
+    engine playing the trivial first-legal-move fallback for an entire
+    game with "nothing written to stderr" in the match log, and no way
+    to tell whether that was v1, numba, or both failing, or why. This
+    always writes to stderr (which every real match log captures, per
+    the competition's own tooling) so a repeat is actually diagnosable
+    instead of just visible-in-hindsight from behavior alone."""
+    exc_type, exc_value, _ = sys.exc_info()
+    print(f"[agent] {layer_name} failed to initialize: {exc_type.__name__}: {exc_value}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+
+
 try:
     import cb_book
 except Exception:
+    _log_layer_failure("cb_book")
     cb_book = None
 
 _v1 = None
@@ -52,6 +73,7 @@ try:
 
     _v1 = cb_engine.Engine()
 except Exception:
+    _log_layer_failure("cb_engine (v1)")
     _v1 = None
 
 _engine = None
@@ -60,6 +82,7 @@ try:
 
     _engine = cb_nb_engine.Engine(process_start=_PROCESS_START)
 except Exception:
+    _log_layer_failure("cb_nb_engine (numba)")
     _engine = None
 
 
@@ -97,6 +120,24 @@ def get_last_score() -> float | None:
     return _last_score
 
 
+_logged_move_failures: set[str] = set()  # log each layer's first per-move failure only, not every move
+
+
+def _log_move_failure(layer_name: str) -> None:
+    """Same reasoning as _log_layer_failure, for a layer that initialized
+    fine but then raised on a specific get_move call. Logged once per
+    layer per process (not once per move) -- a persistently-failing
+    layer would otherwise flood stderr with the same traceback every
+    single move for the rest of the game."""
+    if layer_name in _logged_move_failures:
+        return
+    _logged_move_failures.add(layer_name)
+    exc_type, exc_value, _ = sys.exc_info()
+    print(f"[agent] {layer_name}.get_move failed: {exc_type.__name__}: {exc_value}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     global _last_score
     _last_score = None
@@ -107,7 +148,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             if move is not None and _is_legal(fen, move):
                 return move
         except Exception:
-            pass
+            _log_move_failure("cb_book")
 
     if _engine is not None:
         try:
@@ -116,7 +157,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 _last_score = getattr(_engine, "last_score", None)
                 return move
         except Exception:
-            pass
+            _log_move_failure("cb_nb_engine (numba)")
 
     if _v1 is not None:
         try:
@@ -125,6 +166,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 _last_score = getattr(_v1, "last_score", None)
                 return move
         except Exception:
-            pass
+            _log_move_failure("cb_engine (v1)")
 
     return _fallback_move(fen)

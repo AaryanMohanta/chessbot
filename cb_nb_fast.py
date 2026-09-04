@@ -105,13 +105,27 @@ def _build_signed_pst():
 
 PST_SIGNED_MG, PST_SIGNED_EG, PHASE_WEIGHT_BY_IDX = _build_signed_pst()
 
+# CB_NB_TEXEL_TUNED (default on): picks between the original hand-set
+# scalar weights below ("just be nonzero, Texel tuning finds the real
+# values later") and the values an actual Texel tune produced (2026-09,
+# ratings/texel_tune.py, coordinate descent with L2 regularization
+# against the hand-set values as a prior, on 8,578 quiet self-play
+# positions -- see ratings/texel_data.csv). Same env-var-flag pattern as
+# every other toggle in this file. Three tuner outputs that came back
+# slightly negative (mob_rook_mg, mob_queen_mg, mob_knight_eg) were
+# clamped to 0 before shipping -- "more mobility is bad" isn't something
+# a limited dataset gets to overrule.
+_TEXEL_TUNED = os.environ.get("CB_NB_TEXEL_TUNED", "1") != "0"
+
 # Passed-pawn bonus by relative rank (0 = own back rank, 7 = the square
 # it'd promote from -- unreachable for a pawn still on the board, kept
-# at 0 for safety). Values are a reasonable starting curve, not tuned --
-# Texel tuning is the explicit later step for refining constants like
-# these, not this one.
-PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
-PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
+# at 0 for safety).
+if _TEXEL_TUNED:
+    PASSED_PAWN_BONUS_MG = np.array([0, 3, 6, 20, 32, 56, 96, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_EG = np.array([0, 8, 13, 34, 54, 91, 145, 0], dtype=np.int64)
+else:
+    PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
 
 # Lazy eval: material+PST alone is decisive often enough (a position way
 # outside the search window won't be changed by refining pawn structure/
@@ -120,36 +134,111 @@ PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64
 # [alpha, beta] window by more than this margin, it's returned as-is.
 LAZY_EVAL_MARGIN = 250
 
-# Isolated/doubled pawn penalties -- same "starting curve, not tuned"
-# caveat as the passed-pawn bonuses above.
-ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
-DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
+# King-to-passed-pawn race bonus (2026-09, endgame pass): per unit of
+# (enemy king's Chebyshev distance to the pawn's promotion square minus
+# our own king's distance to it), EG-only. Not part of CB_NB_TEXEL_TUNED
+# (added after that tune ran, and it's a new term rather than a
+# retuned existing one) -- still Texel-tuning-pending like everything
+# else here, but a real, well-established endgame term with no weight
+# at all is a bigger gap than an imperfectly-weighted one.
+KING_PAWN_PROXIMITY_WEIGHT_EG = 5
+
+if _TEXEL_TUNED:
+    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 11, 32
+    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 15, 18
+else:
+    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
+    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
 
 # Rook on an open (no pawns of either colour) or semi-open (no *own*
 # pawns) file. Bigger in the middlegame, where an open file is a real
 # attacking asset; smaller in the endgame, where rook activity tends to
 # come from king/pawn proximity more than file control.
-ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
-ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
+if _TEXEL_TUNED:
+    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 14, 2
+    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 21, 13
+else:
+    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
+    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
 
 # Bishop pair: two bishops covering both square colours are worth more
 # than the sum of two same-colour minor pieces, especially as the board
 # opens up in the endgame.
-BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
+if _TEXEL_TUNED:
+    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 16, 29
+else:
+    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
 
-# King safety: deliberately small weights (see _king_safety_score) --
-# Texel tuning is what finds the real values later; this only needs to
-# be present and not actively harmful. Middlegame-only (no EG term):
-# king safety matters far less once material is traded off, and kings
-# often want to be active/central in the endgame rather than sheltered.
-KING_SHIELD_PENALTY_MG = 10  # per missing pawn in the 3-square shield in front of the king
-KING_OPEN_FILE_PENALTY_MG = 15  # king's own file has no pawns of either colour
-KING_SEMI_OPEN_FILE_PENALTY_MG = 8  # king's own file has no *own* pawns (enemy pawns may be present)
+# King safety, middlegame-only (no EG term): king safety matters far
+# less once material is traded off, and kings often want to be active/
+# central in the endgame rather than sheltered.
+#
+# Retest (2026-09): weights raised substantially from the original
+# "just be nonzero, Texel tuning finds the real values later" starting
+# point, after a real ladder loss (round 4) where the engine never
+# castled, wrecked its own kingside pawns, and pushed queenside pawns
+# while exposed -- the old weights (max realistic total ~15-70cp) were
+# far too small to ever outweigh other eval terms, so the engine had
+# effectively no opinion on king safety at all. Still Texel-tuning-
+# pending like every other weight here, but "not actively harmful" is
+# no longer the bar.
+#
+# CB_NB_KING_SAFETY_V2 (default on) picks between this new set and the
+# original small-weights set -- same env-var-flag pattern as every other
+# toggle in this file, here so the retest can A/B the whole batch (raised
+# weights + castling incentive) in one SPRT against the original values,
+# not because the shipped default is ever meant to be "0".
+_KING_SAFETY_V2 = os.environ.get("CB_NB_KING_SAFETY_V2", "1") != "0"
+
+if _KING_SAFETY_V2 and _TEXEL_TUNED:
+    KING_SHIELD_PENALTY_MG = 26
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 1
+    KING_OPEN_FILE_PENALTY_MG = 35
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 20
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 12
+    CASTLED_BONUS_MG = 33
+    UNCASTLED_EXPOSED_PENALTY_MG = 37
+elif _KING_SAFETY_V2:
+    KING_SHIELD_PENALTY_MG = 25  # per missing pawn in the 3-square shield in front of the king
+    # Extra shield penalty per missing pawn, scaled by how much attacking
+    # material the opponent still has (see KING_ATTACKER_WEIGHT-style
+    # reasoning below) -- a wrecked shield in a queen+rooks middlegame is
+    # dangerous; the same wrecked shield once the opponent's queen and
+    # rooks are gone barely matters.
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 6
+    KING_OPEN_FILE_PENALTY_MG = 35  # king's own file has no pawns of either colour
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 18  # king's own file has no *own* pawns (enemy pawns may be present)
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 10
+    # Castling incentive, deliberately separate from the structural terms
+    # above: a flat bonus for having actually castled (king on g1/c1 or
+    # g8/c8 with no remaining rights -- the only way to reach that square
+    # with rights already gone, short of an extremely unlikely manual
+    # walk), and a flat penalty for having *lost* castling rights without
+    # castling while the opponent still has real attacking material (a
+    # queen or a rook) -- exactly the round-4 pattern: king stuck near
+    # the centre, queen and rooks still on the board on both sides. No
+    # penalty once the opponent's queen and rooks are gone -- an
+    # uncastled king in a quiet, major-piece-free position isn't a safety
+    # problem, it's normal endgame/simplified play.
+    CASTLED_BONUS_MG = 45
+    UNCASTLED_EXPOSED_PENALTY_MG = 40
+else:
+    KING_SHIELD_PENALTY_MG = 10
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 0
+    KING_OPEN_FILE_PENALTY_MG = 15
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 8
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
+    CASTLED_BONUS_MG = 0
+    UNCASTLED_EXPOSED_PENALTY_MG = 0
+
 # Indexed PAWN..KING; only KNIGHT/BISHOP/ROOK/QUEEN are nonzero -- how
 # dangerous one enemy piece of this type attacking the king's immediate
-# zone is considered.
+# zone is considered. Also reused (queen/rook units only) as the
+# "attacking material" scale for the shield-material-bonus and
+# uncastled-exposure penalty above. Unaffected by CB_NB_KING_SAFETY_V2.
 KING_ATTACKER_WEIGHT = np.array([0, 1, 1, 2, 4, 0], dtype=np.int64)
-KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
+ATTACKING_MATERIAL_QUEEN_UNITS = 3
+ATTACKING_MATERIAL_ROOK_UNITS = 1
 
 # Mobility: per-square bonus for each pseudo-legally reachable square not
 # occupied by a piece of the same colour, weighted by piece type
@@ -159,8 +248,15 @@ KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
 # latter naturally reach far more squares, so an equal per-square weight
 # would overweight them relative to how much any one extra square
 # actually matters.
-MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
-MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)
+if _TEXEL_TUNED:
+    # mob_rook_mg/mob_queen_mg/mob_knight_eg came back slightly negative
+    # from the tune (-5, -4, -1) -- clamped to 0 rather than shipped
+    # negative, see the CB_NB_TEXEL_TUNED comment above.
+    MOBILITY_UNIT_MG = np.array([0, 5, 5, 0, 0, 0], dtype=np.int64)
+    MOBILITY_UNIT_EG = np.array([0, 0, 7, 7, 18, 0], dtype=np.int64)
+else:
+    MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
+    MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)
 
 # Rebound to plain module-level names (not accessed as T.PASSED_PAWN_MASK
 # etc.) so they resolve as njit globals the same well-established way
@@ -943,24 +1039,28 @@ def _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, 
 
 
 @njit(cache=False)
-def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+def _king_safety_score(pieces, castling_rights, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                         knight_attacks, king_attacks):
-    """White-minus-black middlegame-only king safety penalty (see the
-    KING_* constants above for why the weights are deliberately small):
+    """White-minus-black middlegame-only king safety penalty:
 
       - pawn shield: the 3 squares one rank in front of the king (its own
-        file and the two adjacent ones) -- a penalty per missing pawn.
+        file and the two adjacent ones) -- a penalty per missing pawn,
+        scaled up by how much attacking material (queen/rooks) the
+        opponent still has.
       - king's own file open (no pawns of either colour) or semi-open
         (no *own* pawns) -- undefended by a friendly pawn wall.
       - enemy knights/bishops/rooks/queens that pseudo-legally attack any
         square in the king's immediate zone (its square + 8 neighbours,
         via king_attacks -- reused as a "zone" mask, not a legal-king-
         move check), weighted by piece type.
+      - castling incentive: bonus for having castled, penalty for having
+        lost the right to without castling while the opponent still has
+        real attacking material (see CASTLED_BONUS_MG's comment).
 
     Reuses mobility's exact same attack-table parameters (already
-    threaded through evaluate_from_state), so this adds no new plumbing
-    beyond king_attacks itself."""
+    threaded through evaluate_from_state); castling_rights is meta[1],
+    threaded in by every caller alongside the position itself."""
     mg = 0
     occ = occupied_all(pieces)
     for color in (0, 1):
@@ -971,13 +1071,18 @@ def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offset
         enemy_pawns = pieces[enemy * 6 + PAWN]
         penalty = 0
 
+        attacking_units = (
+            _popcount(pieces[enemy * 6 + QUEEN]) * ATTACKING_MATERIAL_QUEEN_UNITS
+            + _popcount(pieces[enemy * 6 + ROOK]) * ATTACKING_MATERIAL_ROOK_UNITS
+        )
+
         shield_rank = king_rank + 1 if color == 0 else king_rank - 1
         if 0 <= shield_rank < 8:
             for f in (king_file - 1, king_file, king_file + 1):
                 if 0 <= f < 8:
                     shield_sq = shield_rank * 8 + f
                     if (own_pawns & (np.uint64(1) << np.uint64(shield_sq))) == np.uint64(0):
-                        penalty += KING_SHIELD_PENALTY_MG
+                        penalty += KING_SHIELD_PENALTY_MG + KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG * attacking_units
 
         king_file_mask = _FILE_MASKS[king_file]
         if (own_pawns & king_file_mask) == np.uint64(0):
@@ -1022,6 +1127,19 @@ def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offset
                 attacker_weight += KING_ATTACKER_WEIGHT[QUEEN]
 
         penalty += attacker_weight * KING_ATTACKER_PENALTY_PER_UNIT_MG
+
+        king_side_bit = np.int64(1) if color == 0 else np.int64(4)
+        queen_side_bit = np.int64(2) if color == 0 else np.int64(8)
+        has_rights = (castling_rights & (king_side_bit | queen_side_bit)) != 0
+        castled_kingside_sq = 6 if color == 0 else 62
+        castled_queenside_sq = 2 if color == 0 else 58
+        is_on_castled_square = king_sq == castled_kingside_sq or king_sq == castled_queenside_sq
+
+        if not has_rights:
+            if is_on_castled_square:
+                penalty -= CASTLED_BONUS_MG
+            elif attacking_units > 0:
+                penalty += UNCASTLED_EXPOSED_PENALTY_MG
 
         if color == 0:
             mg -= penalty
@@ -1082,20 +1200,39 @@ def _rook_file_score(pieces):
 
 
 @njit(cache=False)
+def _chebyshev_distance(sq_a, sq_b):
+    file_diff = abs((sq_a % 8) - (sq_b % 8))
+    rank_diff = abs((sq_a // 8) - (sq_b // 8))
+    return file_diff if file_diff > rank_diff else rank_diff
+
+
+@njit(cache=False)
 def _passed_pawn_score(pieces):
-    """White-minus-black (mg, eg) passed-pawn bonus. Unlike material/PST,
-    this isn't maintained incrementally through make_move/unmake_move --
-    "is this pawn's file-triple clear of enemy pawns" doesn't decompose
-    into a simple per-move delta the way a piece landing on/leaving a
+    """White-minus-black (mg, eg) passed-pawn bonus, plus (2026-09,
+    endgame-strength pass) a king-proximity term, EG-only: for each
+    passed pawn, the side whose king is closer to that pawn's promotion
+    square than the opponent's king gets a bonus scaled by the distance
+    difference. This is one of the most standard, highest-value
+    endgame heuristics in any engine ("the side with the active king
+    wins king-and-pawn races") and was entirely absent before -- the
+    king's EG PST already rewards general centralization, but has no
+    idea a specific passed pawn needs escorting or stopping.
+
+    Unlike material/PST, none of this is maintained incrementally
+    through make_move/unmake_move -- "is this pawn's file-triple clear
+    of enemy pawns" and "how far is each king from here" don't decompose
+    into simple per-move deltas the way a piece landing on/leaving a
     square does, so it's recomputed from the piece bitboards at every
     leaf eval instead (cheap: a handful of pawns, one mask-and-compare
-    each)."""
+    and two distance checks each)."""
     mg = 0
     eg = 0
     for color in (0, 1):
         enemy = 1 - color
         own_pawns = pieces[color * 6 + PAWN]
         enemy_pawns = pieces[enemy * 6 + PAWN]
+        own_king_sq = _bit_scan(pieces[color * 6 + KING])
+        enemy_king_sq = _bit_scan(pieces[enemy * 6 + KING])
         bb = own_pawns
         while bb != np.uint64(0):
             square = _bit_scan(bb)
@@ -1104,17 +1241,22 @@ def _passed_pawn_score(pieces):
             if (enemy_pawns & mask) == np.uint64(0):
                 rank = square // 8
                 rel_rank = rank if color == 0 else 7 - rank
+                file = square % 8
+                promo_sq = file + (56 if color == 0 else 0)
+                own_dist = _chebyshev_distance(own_king_sq, promo_sq)
+                enemy_dist = _chebyshev_distance(enemy_king_sq, promo_sq)
+                king_bonus_eg = KING_PAWN_PROXIMITY_WEIGHT_EG * (enemy_dist - own_dist)
                 if color == 0:
                     mg += PASSED_PAWN_BONUS_MG[rel_rank]
-                    eg += PASSED_PAWN_BONUS_EG[rel_rank]
+                    eg += PASSED_PAWN_BONUS_EG[rel_rank] + king_bonus_eg
                 else:
                     mg -= PASSED_PAWN_BONUS_MG[rel_rank]
-                    eg -= PASSED_PAWN_BONUS_EG[rel_rank]
+                    eg -= PASSED_PAWN_BONUS_EG[rel_rank] + king_bonus_eg
     return mg, eg
 
 
 @njit(cache=False)
-def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
+def evaluate_from_state(eval_state, turn, pieces, castling_rights, alpha, beta,
                          rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                          bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                          knight_attacks, king_attacks):
@@ -1163,7 +1305,7 @@ def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
     mob_mg, mob_eg = _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                       bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                                       knight_attacks)
-    ks_mg = _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+    ks_mg = _king_safety_score(pieces, castling_rights, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                                 knight_attacks, king_attacks)
     mg += pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg
