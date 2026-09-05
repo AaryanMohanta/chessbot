@@ -1,35 +1,40 @@
 """Numba bitboard engine wrapper: deadline-based blocking compile with a
 background-compile fallback.
 
-NOT part of the shipped submission yet: not in tools/build_zip.py's
-whitelist, not imported by agent.py. v1 (cb_engine.py) remains the
-fallback and the perft oracle throughout -- this module is where the
-eventual agent.py switchover happens once the numba path clears the
-remaining validation steps (head-to-head SPRT vs v1, tournament-TC
-calibration; see README's "further out" section).
+Shipped: in tools/build_zip.py's whitelist and imported by agent.py as
+the primary engine. v1 (cb_engine.py) remains the fallback whenever
+compilation hasn't finished in time or the numba path fails outright,
+and stays the perft oracle. (This docstring is a holdover from before
+the agent.py switchover -- corrected 2026-09, see git history for when
+the numba path actually went live.)
 
 Why blocking-then-background, not background-only: the competition gives
-a 60s init budget before the game clock starts, with no contention for
-the single core during that window. A background-only design (the first
-cut of this module) throws that budget away and instead pays the full
-JIT compile cost *during play*, where numba's LLVM codegen competes with
-the live search for the one available core -- so the opening moves served
-from v1 during warmup end up slower and weaker than v1 normally is, not
-just "v1 instead of numba".
+a 90s init budget (raised from 60s, 2026-09) before the game clock
+starts, with no contention for the single core during that window. A
+background-only design (the first cut of this module) throws that
+budget away and instead pays the full JIT compile cost *during play*,
+where numba's LLVM codegen competes with the live search for the one
+available core -- so the opening moves served from v1 during warmup end
+up slower and weaker than v1 normally is, not just "v1 instead of numba".
 
 Instead, __init__ compiles normally (blocking) against a wall-clock
 deadline measured from *process start* (see the process_start param --
 agent.py will eventually capture this before any imports run, since
-interpreter/import overhead already eats into the 60s budget before this
+interpreter/import overhead already eats into the 90s budget before this
 class is even constructed). Compilation runs in priority order --
-movegen/make-unmake first, then eval/Zobrist, then the search kernel
-last -- so if the deadline is hit partway through, whatever's already
-warm is the highest-value subset available: the search kernel is both by
-far the largest compile unit and the one v1 substitutes for most cleanly,
-so it's the one left to finish in the background if time runs out.
+movegen/make-unmake first, then eval/Zobrist, then the search kernel,
+then a purely-optional CPU/cache warmup pass last -- so if the deadline
+is hit partway through, whatever's already warm is the highest-value
+subset available: the search kernel is both by far the largest compile
+unit and the one v1 substitutes for most cleanly, so it's the one left
+to finish in the background if time runs out; the warmup pass (2026-09,
+see _stage_cpu_warmup) is lowest priority of all since it's not needed
+for correctness at all, just spending otherwise-idle init time (real
+compile finishes in ~35-42s, well under the 90s budget) on CPU frequency
+scaling and page-cache state before the real clock starts.
 
-Three outcomes, all covered by tests/test_nb_insurance_policy.py:
-  1. All three stages finish inside the deadline (expected on reference
+Four outcomes, the first three covered by tests/test_nb_insurance_policy.py:
+  1. All stages finish inside the deadline (expected on reference
      hardware) -- init returns with numba fully warm, at zero cost to
      live play.
   2. The deadline is hit after some stages -- init returns immediately
@@ -38,6 +43,11 @@ Three outcomes, all covered by tests/test_nb_insurance_policy.py:
      original (now fallback-only) lever #7 path.
   3. A stage raises -- treated as a permanent numba failure; get_move
      falls back to v1 for the rest of the game, no retries.
+  4. Everything through the search kernel finishes but the deadline is
+     hit during the CPU-warmup stage -- functionally identical to
+     outcome 1 (numba was already fully compiled and correct after stage
+     3), just without the warmup's minor latency benefit for the
+     opening moves.
 """
 from __future__ import annotations
 
@@ -46,6 +56,7 @@ import threading
 import time
 
 import chess
+import numpy as np
 
 import cb_engine
 import cb_nb_fast as F
@@ -55,11 +66,15 @@ _WARMUP_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 # Wall-clock budget (seconds, measured from process start -- see the
 # process_start constructor param, not from when compilation begins) for
-# blocking compilation during init. Tune against real numbers from the
-# Linux reference container (see README): it trades "risk of overrunning
-# the 60s hard init budget" against "risk of falling back to the slower,
-# core-contended background-compile path for the opening moves".
-COMPILE_DEADLINE_S = 40.0
+# blocking compilation during init. Raised 40.0 -> 70.0 (2026-09) to match
+# the rules update's 60s -> 90s init budget, keeping the same ~20s safety
+# margin before the hard cutoff: real ladder hardware has consistently
+# compiled in ~28-33s (see round 13-15 match logs), so 70s gives large
+# headroom for v1 to never be the one actually playing, while still
+# trading "risk of overrunning the hard init budget" against "risk of
+# falling back to the slower, core-contended background-compile path for
+# the opening moves" the same way the old 40s/60s pair did.
+COMPILE_DEADLINE_S = 70.0
 
 
 class Engine:
@@ -132,7 +147,34 @@ class Engine:
         warmup_arrays = S.SearchArrays()
         S.search(_WARMUP_FEN, soft_ms=1, hard_ms=50, arrays=warmup_arrays)
 
-    _STAGES = (_stage_movegen, _stage_eval_zobrist, _stage_search)
+    def _stage_cpu_warmup(self) -> None:
+        """Stage 4 (2026-09), lowest priority of all: a longer, more
+        realistic-depth search on the warmup position, spending some of
+        the otherwise-idle init budget (real compile finishes in ~35-42s
+        on reference hardware, well under the 90s budget) actually
+        exercising the CPU at sustained load before the real game clock
+        starts.
+
+        NOT for compilation coverage -- confirmed empirically that numba
+        compiles a whole function ahead of time on its first call rather
+        than lazily per branch, so stage 3's tiny 50ms warmup already
+        fully compiles every function in the real search call graph
+        (root_search/try_move/negamax/quiescence/order_moves/see_capture
+        all get invoked, and therefore fully compiled, even at depth 1).
+        The actual target here is CPU frequency scaling and OS page-cache
+        state: a brief burst of real load is what gets a CPU up to its
+        sustained boost clock and its instruction/data caches populated
+        with the hot search code, and the first few real moves of the
+        game are exactly when that would otherwise still be cold.
+
+        Deliberately last in _STAGES: if the deadline is already tight
+        after the compile stages, this is what gets deferred to the
+        background thread instead, at zero extra risk to the stages that
+        actually matter."""
+        warmup_arrays = S.SearchArrays()
+        S.search(_WARMUP_FEN, soft_ms=3_000, hard_ms=5_000, arrays=warmup_arrays)
+
+    _STAGES = (_stage_movegen, _stage_eval_zobrist, _stage_search, _stage_cpu_warmup)
 
     def _run_stage(self, stage_fn) -> bool:
         """Runs one compile stage. Returns False (and marks the numba
@@ -192,6 +234,10 @@ class Engine:
     def _get_move_numba(self, fen: str, time_left_ms: int) -> str:
         ply = chess.Board(fen).ply()
         budget = self._v1.time_manager.budget(time_left_ms, ply=ply)
+
+        pieces, _mailbox, meta = F.fen_to_state(fen)
+        key = np.uint64(F.compute_hash(pieces, meta))
+        self._arrays.record_game_position(key)
 
         self._generation += 1
         move, score, _info = S.search(

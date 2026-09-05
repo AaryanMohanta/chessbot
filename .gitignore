@@ -27,3 +27,11 @@ tools/books/
 # diagnostic output, not infrastructure. games.csv (the real record of
 # every game played) and zoo/ are tracked; these raw logs are not.
 ratings/calibration_logs/
+
+# Downloaded third-party tuning dataset (Zurichess quiet-labeled.epd,
+# ~725k positions, ~40MB) plus its converted CSV, fetched by
+# tools/convert_quiet_labeled.py -- design doc's own rule is "tuning data
+# never ships, only the fitted numbers go in the zip as a Python file"
+# (see cb_nb_pst_tuned.py), and it doesn't belong in version control for
+# the same reason tools/stockfish/ and tools/books/ don't.
+ratings/data/

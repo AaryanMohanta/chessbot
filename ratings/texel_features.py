@@ -67,25 +67,31 @@ FEATURE_NAMES = [
 # passed/rook/bishop/mobility have identical MG and EG weight structure
 # to the real file; king safety is MG-only (no EG term).
 INITIAL_WEIGHTS = {
-    "isolated_mg": 11, "isolated_eg": 32,
-    "doubled_mg": 15, "doubled_eg": 18,
-    "passed_r1_mg": 3, "passed_r2_mg": 6, "passed_r3_mg": 20, "passed_r4_mg": 32, "passed_r5_mg": 56, "passed_r6_mg": 96,
-    "passed_r1_eg": 8, "passed_r2_eg": 13, "passed_r3_eg": 34, "passed_r4_eg": 54, "passed_r5_eg": 91, "passed_r6_eg": 145,
-    "king_pawn_race_eg": 5,
-    "rook_open_mg": 14, "rook_open_eg": 2,
-    "rook_semiopen_mg": 21, "rook_semiopen_eg": 13,
-    "bishop_pair_mg": 16, "bishop_pair_eg": 29,
-    "mob_knight_mg": 5, "mob_knight_eg": 0,
-    "mob_bishop_mg": 5, "mob_bishop_eg": 7,
-    "mob_rook_mg": 0, "mob_rook_eg": 7,
-    "mob_queen_mg": 0, "mob_queen_eg": 18,
+    # 2026-09: retuned on the full 725k-position Zurichess
+    # quiet-labeled.epd (see cb_nb_fast.py's CB_NB_TEXEL_TUNED comment
+    # for the reg_lambda rescale and the 3 values clamped/floored before
+    # shipping -- mob_queen_mg, king_shield_mg, king_castled_mg). This
+    # dict mirrors the actual shipped defaults, not the raw tuner output,
+    # so it stays the correct "prior" for the next retune.
+    "isolated_mg": 26, "isolated_eg": 11,
+    "doubled_mg": 15, "doubled_eg": 30,
+    "passed_r1_mg": 8, "passed_r2_mg": 8, "passed_r3_mg": 2, "passed_r4_mg": 19, "passed_r5_mg": 40, "passed_r6_mg": 88,
+    "passed_r1_eg": 58, "passed_r2_eg": 48, "passed_r3_eg": 67, "passed_r4_eg": 93, "passed_r5_eg": 153, "passed_r6_eg": 188,
+    "king_pawn_race_eg": 15,
+    "rook_open_mg": 72, "rook_open_eg": -13,
+    "rook_semiopen_mg": 31, "rook_semiopen_eg": 19,
+    "bishop_pair_mg": 52, "bishop_pair_eg": 51,
+    "mob_knight_mg": 12, "mob_knight_eg": 8,
+    "mob_bishop_mg": 8, "mob_bishop_eg": 7,
+    "mob_rook_mg": 0, "mob_rook_eg": 15,
+    "mob_queen_mg": 0, "mob_queen_eg": 24,
     "king_shield_mg": 26,
-    "king_shield_material_mg": 1,
-    "king_open_file_mg": 35,
-    "king_semiopen_file_mg": 20,
-    "king_attacker_mg": 12,
+    "king_shield_material_mg": 6,
+    "king_open_file_mg": 60,
+    "king_semiopen_file_mg": 11,
+    "king_attacker_mg": 8,
     "king_castled_mg": 33,
-    "king_uncastled_exposed_mg": 37,
+    "king_uncastled_exposed_mg": 52,
 }
 
 _KING_ATTACKER_WEIGHT = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}

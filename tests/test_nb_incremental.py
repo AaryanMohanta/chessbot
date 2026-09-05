@@ -53,16 +53,24 @@ def test_incremental_hash_and_eval_match_recompute_over_full_games():
 
 def test_material_pst_component_matches_v1_eval():
     """Cross-check the material+PST component against v1's cb_eval.py on
-    the same position, since both are supposed to compute the identical
-    tapered material+PST score (cb_nb_fast reuses cb_tables.py's data
-    directly). evaluate_from_state's own passed-pawn term is deliberately
-    excluded here -- v1 doesn't have it (see
+    the same position -- true only when both sides are using the SAME
+    PST data (cb_tables.py's hand-set tables). Since CB_NB_TEXEL_TUNED_PST
+    (2026-09) lets cb_nb_fast swap in ratings/pst_tune.py's fit instead
+    -- deliberately different from v1's, which was never in scope for
+    that retune -- this check is only meaningful in hand-set mode.
+    evaluate_from_state's own passed-pawn term is deliberately excluded
+    here -- v1 doesn't have it (see
     test_passed_pawn_score_matches_hand_count below for that term's own
     check) -- by replicating the tapering formula directly from
     eval_state rather than calling evaluate_from_state itself."""
     import chess
+    import pytest
 
     import cb_eval as v1_eval
+
+    if f._TEXEL_TUNED_PST:
+        pytest.skip("cb_nb_fast is using the tuned PST (CB_NB_TEXEL_TUNED_PST=1) -- "
+                    "this cross-check only holds against v1 in hand-set mode")
 
     fen = "r1bq1rk1/ppp2ppp/2n1pn2/3p4/2PP4/2N1PN2/PP3PPP/R1BQ1RK1 w - - 0 8"
     pieces, mailbox, meta = f.fen_to_state(fen)

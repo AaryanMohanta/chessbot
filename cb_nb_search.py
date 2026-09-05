@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import time
 
+import chess
 import numpy as np
 import numba
 from numba import njit, objmode
@@ -64,25 +65,70 @@ ENABLE_TT = os.environ.get("CB_NB_ENABLE_TT", "1") != "0"
 # futility, and late move pruning (LMP). Independently toggleable from
 # the start (not just at batch level) so a failed/inconclusive batch
 # SPRT can be bisected one flag at a time without writing new code.
-# Defaulted OFF pending a retest: the first batch SPRT rejected all three,
-# both together and individually (see ratings/run_pruning_batch_sprt.py
-# and ratings/run_pruning_bisect_sprt.py's logs) -- every one scored below
-# break-even against no pruning. Root cause: the static_eval used here was
-# going through evaluate_from_state's lazy-eval shortcut with the node's
-# real alpha/beta window, so it was often the cheap material+PST-only
-# estimate rather than the full eval (fixed below, plus depth cutoffs
-# tightened) -- must not be silently active in the shipped build until a
-# fresh batch SPRT accepts it.
-ENABLE_RFP = os.environ.get("CB_NB_ENABLE_RFP", "0") != "0"
-ENABLE_FUTILITY = os.environ.get("CB_NB_ENABLE_FUTILITY", "0") != "0"
-ENABLE_LMP = os.environ.get("CB_NB_ENABLE_LMP", "0") != "0"
+#
+# Defaulted ON as of 2026-09's retest (ratings/run_pruning_batch_sprt.py,
+# 108 valid pairs / 216 games at 5+0.05, LLR=+3.190 crossing the H1 bound
+# of +2.944 -- candidate confirmed >= 15 Elo stronger). The first batch
+# SPRT had rejected all three, both together and individually (see
+# ratings/run_pruning_bisect_sprt.py's logs): the static_eval used here
+# was going through evaluate_from_state's lazy-eval shortcut with the
+# node's real alpha/beta window, so it was often the cheap
+# material+PST-only estimate rather than the full eval. That's fixed
+# below (plus tightened depth cutoffs), and this retest is what finally
+# confirmed the fix worked instead of leaving it an open question.
+ENABLE_RFP = os.environ.get("CB_NB_ENABLE_RFP", "1") != "0"
+ENABLE_FUTILITY = os.environ.get("CB_NB_ENABLE_FUTILITY", "1") != "0"
+ENABLE_LMP = os.environ.get("CB_NB_ENABLE_LMP", "1") != "0"
 
 NULL_MOVE_MIN_DEPTH = 3
 NULL_MOVE_REDUCTION = 2
 LMR_MIN_DEPTH = 3
 LMR_MOVE_THRESHOLD = 4
 LMR_REDUCTION = 1
+# LMR retest (2026-09): the base reduction above is flat regardless of
+# how deep the remaining search still has to go -- standard practice in
+# most engines scales the reduction up at higher depth too (there's more
+# search budget left to recover from an over-aggressive reduction via
+# re-search), not just by how late the move is in the ordering. Gated
+# separately from ENABLE_LMR so it's SPRT-testable against the flat
+# scheme alone rather than folded in blind.
+ENABLE_LMR_DEPTH_SCALING = os.environ.get("CB_NB_ENABLE_LMR_DEPTH_SCALING", "0") != "0"
+LMR_DEEP_DEPTH = 6
+LMR_DEEP_EXTRA_REDUCTION = 1
+
+ENABLE_ASPIRATION = os.environ.get("CB_NB_ENABLE_ASPIRATION", "1") != "0"
+
+# Aspiration windows (2026-09, design doc sec.5): from ASPIRATION_MIN_DEPTH
+# on, search()'s ID loop starts each iteration with a narrow window around
+# the previous iteration's score instead of full width -- most positions'
+# evaluation doesn't swing much between consecutive depths, so a narrow
+# window lets alpha-beta prune far more of the tree for the same result.
+# When the previous score is close to it, though, the window doesn't
+# help (see ASPIRATION_MATE_MARGIN below) and re-search costs make it a
+# net loss to even try. On a fail-low/fail-high, root_search's returned
+# score is only a bound (see its own BOUND_UPPER/BOUND_LOWER comment) --
+# widen and re-search the SAME depth before trusting it or moving on.
+ASPIRATION_MIN_DEPTH = 5
+ASPIRATION_WINDOW = 30
+ASPIRATION_MATE_MARGIN = MATE_THRESHOLD - 2_000  # stay clear of MATE_THRESHOLD even after widening once
 KILLER_BASE_SCORE = 500_000
+# Ordering bases for the two capture classes SEE distinguishes below
+# (2026-09, replacing raw MVV-LVA for ordering -- SEE was already
+# computed for quiescence pruning, this reuses it): a winning-or-equal
+# capture is a forcing tactical move and belongs ahead of the killer
+# heuristic, which only exists to approximate that value for QUIET
+# moves; a losing capture is worse than an average quiet move and design
+# doc §5's own priority list puts it dead last, after history. Bug fixed
+# in the same change: the previous MVV-LVA scores (victim*16 - attacker,
+# max ~14.4k for QxQ) never actually exceeded KILLER_BASE_SCORE
+# (500,000) despite the docstring's claimed "captures before killers"
+# ordering -- captures were silently being searched AFTER killers this
+# entire time. WINNING_CAPTURE_BASE/LOSING_CAPTURE_BASE are offset far
+# enough from 0 that a realistic SEE value (bounded by piece values,
+# at most a few thousand even for a multi-piece exchange) can't cross
+# into the neighboring band.
+WINNING_CAPTURE_BASE = 600_000
+LOSING_CAPTURE_BASE = -1_000_000
 
 # Reverse futility pruning ("static null move"): if the static eval
 # already beats beta by more than this margin (scaled by depth), the
@@ -126,7 +172,22 @@ DELTA_MARGIN = 200
 BF_EMA_WEIGHT = 0.5
 MIN_BRANCHING_FACTOR = 1.2
 MAX_BRANCHING_FACTOR = 8.0
-_CAPTURE_VALUE = np.array([100, 320, 330, 500, 900, 0], dtype=np.int64)  # pawn..king, 0-indexed
+# Material values for SEE (move ordering + quiescence pruning), pawn..
+# king, 0-indexed -- pulled from whichever material table cb_nb_fast.py's
+# CB_NB_TEXEL_TUNED_PST flag actually has active, not a separate
+# hardcoded copy, so SEE's idea of a piece's worth can't silently drift
+# out of sync with what the eval itself uses (2026-09, added when
+# material values became tunable via ratings/joint_tune.py). SEE is a
+# single flat scale, not mg/eg-tapered, so this uses the mg values --
+# same simplification every other engine's SEE makes.
+if F._TEXEL_TUNED_PST:
+    _MATERIAL_MG = F.PST_TUNED.PIECE_VALUES_MG
+else:
+    _MATERIAL_MG = F.V1_TABLES.PIECE_VALUES_MG
+_CAPTURE_VALUE = np.array([
+    _MATERIAL_MG[chess.PAWN], _MATERIAL_MG[chess.KNIGHT], _MATERIAL_MG[chess.BISHOP],
+    _MATERIAL_MG[chess.ROOK], _MATERIAL_MG[chess.QUEEN], _MATERIAL_MG[chess.KING],
+], dtype=np.int64)
 
 # Same node-count-polled hard-deadline mechanism as v1's cb_search.py
 # (checked every NODE_CHECK_INTERVAL nodes, not every node -- time.perf_
@@ -197,9 +258,64 @@ class SearchArrays:
         self.killers = np.full((MAX_PLY, 2), -1, dtype=np.int64)
         self.history = np.zeros((12, 64), dtype=np.int64)
 
+        # Repetition detection (2026-09, after a real ladder loss --
+        # round 15 -- where the engine gave up a completely won game,
+        # up a full queen, by walking a checking sequence into a
+        # threefold-repetition draw entirely on its own initiative). Two
+        # parts:
+        #   path_keys[ply]: the Zobrist key at each ply of the CURRENT
+        #     line being explored in THIS search call, index 0 = the
+        #     root position itself. Reused across iterative-deepening
+        #     iterations without resetting -- only path_keys[0:ply] is
+        #     ever read at a given node, so stale deeper entries from a
+        #     previous (deeper) iteration are simply never looked at.
+        #   game_history_keys[0:game_history_count]: Zobrist keys of
+        #     every REAL position seen so far at the start of one of our
+        #     own turns (see cb_nb_engine.py) -- persists for the whole
+        #     game, unlike path_keys. This is a partial history (the
+        #     wire protocol hands us a fresh FEN per call with no move
+        #     list, so we only ever observe positions where it's our own
+        #     turn, never the opponent's intermediate replies), same
+        #     limitation v1's cb_engine.py already documents for its own
+        #     (currently unused) position_counts dict -- good enough to
+        #     catch "I've already been in exactly this position with the
+        #     move now available to me," which is exactly what a search-
+        #     tree-only check can't see across separate get_move calls.
+        self.path_keys = np.zeros(MAX_PLY, dtype=np.uint64)
+        self.game_history_keys = np.zeros(512, dtype=np.uint64)
+        self.game_history_count = 0
+
+    def record_game_position(self, key) -> None:
+        """Call once per get_move, with the position's Zobrist key
+        BEFORE searching -- see cb_nb_engine.py."""
+        if self.game_history_count < len(self.game_history_keys):
+            self.game_history_keys[self.game_history_count] = key
+            self.game_history_count += 1
+
     def reset_killers_history(self):
         self.killers.fill(-1)
         self.history.fill(0)
+
+
+@njit(cache=False)
+def _is_repetition(key, ply, path_keys, game_history_keys, game_history_count):
+    """True if ``key`` matches an earlier position either in the current
+    search line (path_keys[0:ply], where index 0 is the root position
+    itself) or in the real game so far (game_history_keys[0:
+    game_history_count]) -- treating a single earlier match as enough to
+    call a node a draw, not waiting to actually reach a third occurrence.
+    Standard practice: two occurrences already means the position is
+    reachable again, which is exactly the signal a search needs to
+    avoid it when ahead (or seek it when behind) -- waiting for a literal
+    third repetition before scoring it as a draw would only find that
+    out one ply too late to route around it."""
+    for i in range(ply):
+        if path_keys[i] == key:
+            return True
+    for i in range(game_history_count):
+        if game_history_keys[i] == key:
+            return True
+    return False
 
 
 @njit(numba.int64(numba.int64, numba.int64), cache=False)
@@ -378,18 +494,20 @@ def see_capture(move, side_to_move, pieces, mailbox,
     return gain[0]
 
 
-@njit(numba.void(
-    numba.uint64[:], numba.int64[:], numba.int64[:], numba.int64, numba.int64[:],
-    numba.int64, numba.int64, numba.int64, numba.int64[:, :],
-), cache=False)
-def order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history):
+@njit(cache=False)
+def order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                 rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                 knight_attacks, king_attacks, pawn_attacks):
     """Fills scores_buf[:count] and insertion-sorts moves[:count]
-    descending by score: TT move highest, then MVV-LVA for captures/
-    promotions, then the two killers, then quiets by history score --
-    matches v1's cb_order.py. Quiescence calls this too (with
-    killer0=killer1=-1, real history array) -- the killer/history branch
-    is simply dead there since a captures-only move list never reaches
-    it, cheaper than a second code path."""
+    descending by score: TT move highest, then winning-or-equal captures
+    and promotions by SEE value, then the two killers, then quiets by
+    history score, then losing captures by SEE value -- see
+    WINNING_CAPTURE_BASE/LOSING_CAPTURE_BASE above for why captures split
+    around the killer band instead of all sitting above it. Quiescence
+    calls this too (with killer0=killer1=-1, real history array) -- the
+    killer/history branch is simply dead there since a captures-only
+    move list never reaches it, cheaper than a second code path."""
     for i in range(count):
         move = moves[i]
         if move == tt_move:
@@ -400,13 +518,17 @@ def order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, kil
         from_sq = move & 0x3F
         is_capture = mailbox[to_sq] != -1 or ((move >> 15) & 0x7) == F.FLAG_EP
         if promo != F.NO_PROMO or is_capture:
-            victim_value = _capture_value_of(pieces, mailbox, move)
             attacker_idx = mailbox[from_sq]
-            attacker_value = _CAPTURE_VALUE[attacker_idx % 6] if attacker_idx != -1 else 0
-            score = victim_value * 16 - attacker_value
+            side_to_move = attacker_idx // 6
+            see = see_capture(
+                move, side_to_move, pieces, mailbox,
+                rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                knight_attacks, king_attacks, pawn_attacks,
+            ) if is_capture else 0
             if promo != F.NO_PROMO:
-                score += 100_000 + _CAPTURE_VALUE[promo]
-            scores_buf[i] = score
+                see += _CAPTURE_VALUE[promo]
+            scores_buf[i] = WINNING_CAPTURE_BASE + see if see >= 0 else LOSING_CAPTURE_BASE + see
         elif ENABLE_KILLERS_HISTORY and move == killer0:
             scores_buf[i] = KILLER_BASE_SCORE + 1
         elif ENABLE_KILLERS_HISTORY and move == killer1:
@@ -480,7 +602,10 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
             captures_buf[cap_count] = move
             cap_count += 1
 
-    order_moves(pieces, mailbox, captures_buf, cap_count, scores_buf, -1, -1, -1, history)
+    order_moves(pieces, mailbox, captures_buf, cap_count, scores_buf, -1, -1, -1, history,
+                rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                knight_attacks, king_attacks, pawn_attacks)
 
     for i in range(cap_count):
         move = captures_buf[i]
@@ -593,7 +718,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
              zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
              pst_mg, pst_eg, phase_weight,
              moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-             killers, history):
+             killers, history, path_keys, game_history_keys, game_history_count):
     """Kernel split: make_move + legality check + PVS/LMR recursion +
     unmake_move, extracted out of negamax's own body. negamax previously
     had this whole block duplicated at 3 textual call sites (first move,
@@ -631,6 +756,8 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                                             knight_attacks, king_attacks, pawn_attacks)
         if not gives_check:
             reduction = LMR_REDUCTION
+            if ENABLE_LMR_DEPTH_SCALING and depth >= LMR_DEEP_DEPTH:
+                reduction += LMR_DEEP_EXTRA_REDUCTION
 
     if is_first:
         score = -negamax(pieces, mailbox, meta, depth - 1, -beta, -alpha, ply + 1, generation, True,
@@ -644,7 +771,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history)
+                          killers, history, path_keys, game_history_keys, game_history_count)
     else:
         score = -negamax(pieces, mailbox, meta, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, generation, True,
                           zobrist, eval_state, nodes, hard_deadline,
@@ -657,7 +784,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history)
+                          killers, history, path_keys, game_history_keys, game_history_count)
         if score > alpha:
             score = -negamax(pieces, mailbox, meta, depth - 1, -beta, -alpha, ply + 1, generation, True,
                               zobrist, eval_state, nodes, hard_deadline,
@@ -670,7 +797,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                               zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                               pst_mg, pst_eg, phase_weight,
                               moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                              killers, history)
+                              killers, history, path_keys, game_history_keys, game_history_count)
 
     F.unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
                   zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
@@ -690,13 +817,22 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
             zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
             pst_mg, pst_eg, phase_weight,
             moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-            killers, history):
+            killers, history, path_keys, game_history_keys, game_history_count):
     nodes[0] += 1
     if nodes[0] % NODE_CHECK_INTERVAL == 0 and _now() >= hard_deadline:
         raise _SearchTimeout()
     alpha_orig = alpha
 
     key = zobrist[0]
+    # Repetition check BEFORE the TT probe, and skipping the TT entirely
+    # for a drawn-by-repetition node: whether this exact position is a
+    # repeat depends on the PATH taken to reach it, not just the
+    # position itself, so a repetition-draw score cached under this
+    # key would be wrong to reuse from a different line where the same
+    # position isn't a repeat at all.
+    if _is_repetition(key, ply, path_keys, game_history_keys, game_history_count):
+        return 0
+    path_keys[ply] = key
     found, tt_depth, tt_score_raw, tt_bound, tt_move = tt_probe(key, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
     if not ENABLE_TT:
         found = False
@@ -782,7 +918,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                pst_mg, pst_eg, phase_weight,
                                moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                               killers, history)
+                               killers, history, path_keys, game_history_keys, game_history_count)
         unmake_null_move(meta, old_ep, zobrist, zobrist_ep_file, zobrist_side)
         if null_score >= beta:
             return null_score
@@ -797,7 +933,10 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                            castle_empty_squares, castle_king_path)
     killer0 = killers[ply, 0] if ply < MAX_PLY else -1
     killer1 = killers[ply, 1] if ply < MAX_PLY else -1
-    order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history)
+    order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                knight_attacks, king_attacks, pawn_attacks)
 
     best = -MATE_SCORE - 1
     best_move = -1
@@ -842,7 +981,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history)
+                                 killers, history, path_keys, game_history_keys, game_history_count)
         if not legal:
             continue
         legal_seen += 1
@@ -873,7 +1012,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
 
 
 @njit(cache=False)
-def root_search(pieces, mailbox, meta, depth, generation,
+def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                  zobrist, eval_state, nodes, hard_deadline,
                  tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations,
                  rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
@@ -884,7 +1023,7 @@ def root_search(pieces, mailbox, meta, depth, generation,
                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                  pst_mg, pst_eg, phase_weight,
                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                 killers, history):
+                 killers, history, path_keys, game_history_keys, game_history_count):
     # Root never null-moves (needs a real move to return) -- LMR isn't
     # applied here either, matching v1: root's window is already
     # (near-)full on move 1 so PVS's own null-window narrowing does most
@@ -908,11 +1047,14 @@ def root_search(pieces, mailbox, meta, depth, generation,
                                            castle_empty_squares, castle_king_path)
     killer0 = killers[0, 0]
     killer1 = killers[0, 1]
-    order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history)
+    order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                knight_attacks, king_attacks, pawn_attacks)
 
     color = meta[0]
     opponent = 1 - color
-    alpha, beta = -MATE_SCORE - 1, MATE_SCORE + 1
+    alpha_orig = alpha
     best_score = -MATE_SCORE - 1
     best_move = -1
     legal_seen = 0
@@ -933,7 +1075,7 @@ def root_search(pieces, mailbox, meta, depth, generation,
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history)
+                                 killers, history, path_keys, game_history_keys, game_history_count)
         if not legal:
             continue
         legal_seen += 1
@@ -944,8 +1086,21 @@ def root_search(pieces, mailbox, meta, depth, generation,
         if best_score > alpha:
             alpha = best_score
 
+    # Aspiration windows (2026-09) mean this call's alpha/beta may be a
+    # narrow window around the previous iteration's score, not the
+    # historically-always-full [-MATE-1, MATE+1] -- so best_score can now
+    # genuinely be only a bound rather than the exact score, same
+    # fail-soft classification negamax already does at every other node.
+    # search()'s ID loop is the one that notices this (best_score <=
+    # alpha or >= beta) and re-searches this depth with a wider window;
+    # this only has to get the TT bound type right, not decide to widen.
+    bound = BOUND_EXACT
+    if best_score <= alpha_orig:
+        bound = BOUND_UPPER
+    elif best_score >= beta:
+        bound = BOUND_LOWER
     if ENABLE_TT:
-        tt_store(key, depth, score_to_tt(best_score, 0), BOUND_EXACT, best_move, generation, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
+        tt_store(key, depth, score_to_tt(best_score, 0), bound, best_move, generation, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
     return best_score, best_move
 
 
@@ -998,6 +1153,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
     arrays.eval_state[0], arrays.eval_state[1], arrays.eval_state[2] = mg, eg, phase
     arrays.nodes[0] = 0
     arrays.reset_killers_history()  # per-move, like v1's fresh _Searcher each call
+    arrays.path_keys[0] = arrays.zobrist[0]
 
     start = time.perf_counter()
     soft_deadline = start + max(0.0, soft_ms) / 1000
@@ -1006,26 +1162,43 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
     best_move, best_score, depth_reached = -1, 0, 0
     prev_nodes = None
     smoothed_bf = None
+    prev_score = None
 
     depth = 1
     while depth <= max_depth:
+        if (not ENABLE_ASPIRATION or depth < ASPIRATION_MIN_DEPTH or prev_score is None
+                or abs(prev_score) >= ASPIRATION_MATE_MARGIN):
+            alpha, beta = -MATE_SCORE - 1, MATE_SCORE + 1
+        else:
+            alpha = max(prev_score - ASPIRATION_WINDOW, -MATE_SCORE - 1)
+            beta = min(prev_score + ASPIRATION_WINDOW, MATE_SCORE + 1)
+
         nodes_before = int(arrays.nodes[0])
         iter_start = time.perf_counter()
         try:
-            score, move = root_search(
-                pieces, mailbox, meta, depth, generation,
-                arrays.zobrist, arrays.eval_state, arrays.nodes, hard_deadline,
-                arrays.tt_keys, arrays.tt_depths, arrays.tt_scores, arrays.tt_bounds, arrays.tt_moves, arrays.tt_generations,
-                t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
-                t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-                t.knight_attacks, t.king_attacks, t.pawn_attacks,
-                t.castle_king_to, t.castle_rook_from, t.castle_rook_to, t.castle_right_bit,
-                t.castle_empty_squares, t.castle_king_path, t.castle_all_rook_squares, t.castle_all_rook_bits,
-                t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side,
-                t.pst_mg, t.pst_eg, t.phase_weight,
-                arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
-                arrays.killers, arrays.history,
-            )
+            while True:
+                score, move = root_search(
+                    pieces, mailbox, meta, depth, generation, alpha, beta,
+                    arrays.zobrist, arrays.eval_state, arrays.nodes, hard_deadline,
+                    arrays.tt_keys, arrays.tt_depths, arrays.tt_scores, arrays.tt_bounds, arrays.tt_moves, arrays.tt_generations,
+                    t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+                    t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
+                    t.knight_attacks, t.king_attacks, t.pawn_attacks,
+                    t.castle_king_to, t.castle_rook_from, t.castle_rook_to, t.castle_right_bit,
+                    t.castle_empty_squares, t.castle_king_path, t.castle_all_rook_squares, t.castle_all_rook_bits,
+                    t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side,
+                    t.pst_mg, t.pst_eg, t.phase_weight,
+                    arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
+                    arrays.killers, arrays.history,
+                    arrays.path_keys, arrays.game_history_keys, arrays.game_history_count,
+                )
+                if score <= alpha and alpha > -MATE_SCORE - 1:
+                    alpha = -MATE_SCORE - 1  # fail-low: widen down, same depth
+                    continue
+                if score >= beta and beta < MATE_SCORE + 1:
+                    beta = MATE_SCORE + 1  # fail-high: widen up, same depth
+                    continue
+                break
         except _SearchTimeout:
             # This iteration never finished -- its partial TT/killer
             # writes are still valid (each is written as it's found, not
@@ -1033,6 +1206,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
             # interrupted root_search, so keep whatever the last
             # *completed* iteration returned instead.
             break
+        prev_score = score
 
         now = time.perf_counter()
         this_duration = now - iter_start

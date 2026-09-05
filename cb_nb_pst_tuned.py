@@ -1,0 +1,65 @@
+"""Texel-tuned material values + piece-square tables (2026-09),
+replacing cb_tables.py's hand-set PST_MG/PST_EG *and* PIECE_VALUES_MG/EG
+for the numba eval only -- v1 (cb_eval.py) keeps the original hand-set
+tables and material unchanged. Fit by ratings/joint_tune.py via Adam on
+the full 725k-position Zurichess quiet-labeled.epd, holding the 37 scalar
+eval terms fixed (already tuned separately, see ratings/texel_tune.py).
+Supersedes the PST-only tune (ratings/pst_tune.py) -- the PST values here
+were fit jointly with these material values, so mixing this PST with the
+old hand-set material (or vice versa) is an untested combination.
+
+Validated on a held-out 20% split: 1.37% lower MSE than the hand-set
+material+PST prior (0.062141 vs 0.063005) -- a real, non-overfit
+generalization gain. Material values moved in directions that match
+standard chess knowledge, not just noise: pawns and rooks gain value in
+the endgame relative to the middlegame, bishops keep their edge over
+knights. See cb_nb_fast.py's CB_NB_TEXEL_TUNED_PST comment for wiring.
+
+Same a1=0..h8=63 square order as cb_tables.py, values from WHITE's
+perspective -- indexing and sign convention are identical, this is a
+drop-in replacement for PST_MG[pt]/PST_EG[pt]/PIECE_VALUES_MG[pt]/
+PIECE_VALUES_EG[pt].
+"""
+from __future__ import annotations
+
+import chess
+
+# fmt: off
+
+PST_MG: dict[chess.PieceType, list[int]] = {
+    chess.PAWN: [0, 0, 5, 10, 10, 5, 0, 0, 2, 5, 6, 6, 4, 11, 13, 2, 9, 7, 17, 20, 22, 20, 19, 12, 16, 16, 24, 35, 36, 30, 18, 15, 32, 35, 39, 50, 50, 42, 35, 30, 59, 59, 65, 68, 70, 67, 60, 59, 91, 91, 95, 100, 100, 95, 90, 90, 0, 0, 5, 10, 10, 5, 0, 0],
+    chess.KNIGHT: [-40, -27, -21, -10, -10, -20, -26, -40, -30, -20, -11, 3, 4, -8, -20, -28, -23, -10, 0, 10, 11, 4, -6, -19, -11, 0, 9, 16, 20, 9, 1, -9, -10, 1, 9, 22, 17, 12, 1, -9, -21, -9, 0, 11, 11, 1, -8, -20, -31, -20, -9, 0, 0, -9, -20, -30, -41, -30, -20, -10, -10, -20, -30, -40],
+    chess.BISHOP: [-20, -11, -4, 4, 4, -4, -12, -20, -12, 4, 5, 12, 14, 5, 12, -12, -4, 5, 14, 17, 19, 15, 7, -3, 4, 12, 17, 28, 28, 15, 11, 4, 4, 10, 19, 29, 28, 20, 11, 4, -5, 4, 13, 20, 20, 13, 5, -4, -12, -4, 3, 11, 12, 5, -3, -14, -20, -12, -4, 4, 4, -4, -12, -20],
+    chess.ROOK: [1, 2, 3, 7, 8, 8, -2, 2, -4, 0, -1, 4, 4, 1, 0, -5, -2, -1, -1, 3, 4, 0, 0, -1, -1, 0, 0, 4, 4, 0, 0, 0, 0, 0, 1, 4, 4, 1, 0, 0, 0, 0, 0, 4, 4, 1, 1, 0, 10, 10, 11, 15, 14, 11, 10, 10, 0, 0, 0, 4, 4, 0, 0, 0],
+    chess.QUEEN: [-4, -3, 0, 9, 2, -1, -3, -5, -4, -1, 6, 8, 10, 3, -1, -2, -2, 2, 2, 4, 5, 4, 3, 0, -2, 1, 3, 4, 5, 5, 3, 2, 0, 0, 3, 4, 6, 5, 4, 1, -2, 0, 2, 5, 6, 4, 2, 2, -4, -5, 1, 3, 3, 2, 0, -1, -5, -3, -1, 1, 2, 0, -2, -3],
+    chess.KING: [18, 32, 5, -11, -6, 6, 21, 18, 4, 16, -4, -26, -24, -4, 20, 6, -10, 0, -20, -40, -40, -20, 1, -11, -25, -15, -35, -55, -55, -35, -15, -26, -40, -30, -49, -70, -70, -49, -29, -40, -55, -45, -64, -85, -85, -64, -44, -55, -70, -60, -80, -100, -100, -80, -60, -70, -85, -75, -95, -115, -115, -95, -75, -85],
+}
+
+PST_EG: dict[chess.PieceType, list[int]] = {
+    chess.PAWN: [0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 7, 3, 6, 7, 2, 1, 8, 11, 9, 12, 12, 11, 8, 7, 20, 21, 18, 16, 17, 18, 20, 19, 36, 34, 33, 28, 30, 32, 35, 34, 64, 63, 60, 56, 56, 58, 61, 61, 103, 102, 100, 99, 100, 99, 100, 102, 0, 0, 0, 0, 0, 0, 0, 0],
+    chess.KNIGHT: [-30, -22, -14, -5, -5, -13, -22, -30, -22, -14, -6, 1, 3, -6, -14, -22, -14, -5, 0, 10, 10, -1, -6, -13, -5, 2, 11, 19, 18, 11, 3, -6, -5, 3, 11, 20, 19, 11, 3, -5, -14, -5, 3, 10, 10, 3, -6, -14, -22, -13, -6, 3, 2, -6, -14, -22, -31, -22, -14, -7, -6, -15, -22, -31],
+    chess.BISHOP: [-10, -4, 2, 6, 6, 1, -5, -10, -4, 0, 5, 10, 9, 5, 1, -5, 1, 7, 11, 15, 16, 10, 6, 1, 5, 10, 15, 20, 18, 14, 9, 5, 6, 11, 15, 20, 19, 15, 10, 6, 1, 6, 10, 14, 14, 10, 6, 1, -4, 1, 5, 9, 10, 6, 0, -5, -10, -5, 0, 5, 5, 0, -5, -10],
+    chess.ROOK: [1, 1, 1, 0, 0, 1, 0, -3, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 1, 1, 2, 0, 0, 0, 0, 0, 2, 1, 2, 1, 0, 2, 0, 2, 2, 2, 1, 1, 0, 1, 2, 1, 16, 16, 16, 15, 14, 16, 16, 16, 2, 1, 1, 1, 1, 1, 1, 1],
+    chess.QUEEN: [-4, -2, 1, 5, 5, 1, -2, -5, -2, 1, 4, 7, 8, 5, 1, -2, 1, 4, 7, 9, 10, 8, 5, 2, 4, 7, 9, 12, 12, 10, 8, 5, 4, 6, 9, 11, 13, 10, 8, 6, 1, 3, 6, 10, 11, 8, 5, 3, -2, 0, 4, 7, 8, 5, 2, -1, -5, -1, 2, 5, 5, 2, -1, -3],
+    chess.KING: [-33, -24, -19, -7, -11, -16, -28, -39, -24, -14, -4, 3, 4, -5, -14, -25, -15, -6, 3, 12, 13, 4, -4, -16, -7, 1, 11, 19, 20, 12, 2, -9, -7, 3, 12, 20, 19, 13, 4, -7, -14, -5, 3, 11, 11, 6, -3, -14, -22, -13, -5, 3, 3, -4, -13, -22, -30, -22, -14, -6, -6, -14, -22, -30],
+}
+
+PIECE_VALUES_MG: dict[chess.PieceType, int] = {
+    chess.PAWN: 95,
+    chess.KNIGHT: 348,
+    chess.BISHOP: 353,
+    chess.ROOK: 515,
+    chess.QUEEN: 915,
+    chess.KING: 0,
+}
+
+PIECE_VALUES_EG: dict[chess.PieceType, int] = {
+    chess.PAWN: 107,
+    chess.KNIGHT: 332,
+    chess.BISHOP: 346,
+    chess.ROOK: 542,
+    chess.QUEEN: 918,
+    chess.KING: 0,
+}
+
+# fmt: on

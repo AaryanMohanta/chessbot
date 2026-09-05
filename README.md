@@ -11,10 +11,10 @@ violation is caught locally instead of at validation.
 - Python 3.12, full stdlib, and only: `torch==2.13.0+cpu`, `numpy==2.5.2`, `python-chess==1.11.2` (imported as `chess`), `onnxruntime==1.29.0`, `numba==0.67.0`. Nothing else installs at validation; `requirements.txt` in the zip is ignored. Any other import crashes the agent.
 - No native binaries in the zip (no Cython/compiled extensions). `.onnx` / `.safetensors` / `.pt` weight files are fine.
 - The zip goes first on `sys.path` — no shipped file may be named after a module we import (`chess.py`, `random.py`, `types.py`, ...). Hence the `cb_` prefix on every module we add.
-- Runtime: 1 core, 2 GB RAM, no network, no GPU, read-only FS except 256 MB at `/tmp`.
-- Clock: 120 s per side + 0.5 s increment, with a 60 s init budget spent *before* the clock starts.
+- Runtime: 1 core of an AMD EPYC 9V74 @ 2.60 GHz (specified 2026-09; previously just "1 core"), 2 GB RAM, no network, no GPU, read-only FS except 256 MB at `/tmp`.
+- Clock: 120 s per side + 0.5 s increment, with a 90 s init budget spent *before* the clock starts (raised from 60 s, 2026-09 rules update).
 - Output cap: 4096 bytes/move. Malformed output = illegal move = loss.
-- One process per game, alive between moves, keeps its core after `get_move` returns.
+- One process per game, alive between moves, but suspended while the opponent is thinking (2026-09 rules update: pondering is explicitly disabled, not just unimplemented).
 
 See `chessathon-engine-design.md` for the full architecture and the day-by-day
 plan. This repo currently implements days 1-2 of that plan: a correct,

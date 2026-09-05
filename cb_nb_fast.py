@@ -32,6 +32,17 @@ from numba import njit
 
 import cb_nb_tables as T
 import cb_tables as V1_TABLES  # reuse the already-tuned v1 PST/material data
+import cb_nb_pst_tuned as PST_TUNED
+
+# CB_NB_TEXEL_TUNED_PST (default on): picks between cb_tables.py's
+# hand-set PST_MG/PST_EG and the ones ratings/pst_tune.py fit on the
+# full 725k-position dataset (material and the 37 scalar terms held
+# fixed -- see cb_nb_pst_tuned.py's own docstring for the held-out
+# validation number). Separate flag from CB_NB_TEXEL_TUNED since the two
+# were fit independently (PST tuning came after, holding the scalar
+# retune's output fixed as a base) and either should be independently
+# A/B-testable.
+_TEXEL_TUNED_PST = os.environ.get("CB_NB_TEXEL_TUNED_PST", "1") != "0"
 
 # Same env-var-flag pattern as cb_nb_search.py's CB_NB_ENABLE_KILLERS_HISTORY
 # etc.: lets ratings/sprt.py A/B the *same* compiled module with the six
@@ -84,10 +95,20 @@ def _build_signed_pst():
         # its dicts by python-chess's own 1-indexed constants (PAWN=1..
         # KING=6) -- +1 bridges the two conventions.
         chess_pt = pt + 1
-        mg_val = V1_TABLES.PIECE_VALUES_MG[chess_pt]
-        eg_val = V1_TABLES.PIECE_VALUES_EG[chess_pt]
-        mg_pst = V1_TABLES.PST_MG[chess_pt]
-        eg_pst = V1_TABLES.PST_EG[chess_pt]
+        if _TEXEL_TUNED_PST:
+            # Material values here come from the SAME joint fit as the
+            # PST cells below (ratings/joint_tune.py) -- mixing this PST
+            # with the old hand-set material (or vice versa) was never
+            # validated, so both switch on the one flag together.
+            mg_val = PST_TUNED.PIECE_VALUES_MG[chess_pt]
+            eg_val = PST_TUNED.PIECE_VALUES_EG[chess_pt]
+            mg_pst = PST_TUNED.PST_MG[chess_pt]
+            eg_pst = PST_TUNED.PST_EG[chess_pt]
+        else:
+            mg_val = V1_TABLES.PIECE_VALUES_MG[chess_pt]
+            eg_val = V1_TABLES.PIECE_VALUES_EG[chess_pt]
+            mg_pst = V1_TABLES.PST_MG[chess_pt]
+            eg_pst = V1_TABLES.PST_EG[chess_pt]
         weight = V1_TABLES.PHASE_WEIGHTS[chess_pt]
 
         white_idx = 0 * 6 + pt
@@ -107,22 +128,42 @@ PST_SIGNED_MG, PST_SIGNED_EG, PHASE_WEIGHT_BY_IDX = _build_signed_pst()
 
 # CB_NB_TEXEL_TUNED (default on): picks between the original hand-set
 # scalar weights below ("just be nonzero, Texel tuning finds the real
-# values later") and the values an actual Texel tune produced (2026-09,
-# ratings/texel_tune.py, coordinate descent with L2 regularization
-# against the hand-set values as a prior, on 8,578 quiet self-play
-# positions -- see ratings/texel_data.csv). Same env-var-flag pattern as
-# every other toggle in this file. Three tuner outputs that came back
-# slightly negative (mob_rook_mg, mob_queen_mg, mob_knight_eg) were
-# clamped to 0 before shipping -- "more mobility is bad" isn't something
-# a limited dataset gets to overrule.
+# values later") and the values an actual Texel tune produced.
+#
+# Retuned 2026-09 on the real Zurichess quiet-labeled.epd (725,000
+# positions -- see ratings/data/quiet_labeled.csv, converted via
+# tools/convert_quiet_labeled.py), replacing the first pass's 8,578
+# self-play positions (ratings/texel_data.csv, kept only as a smaller
+# fallback dataset). reg_lambda scaled down from 5e-7 to 5.9e-9
+# (proportional to the ~85x data increase -- see texel_error's docstring
+# on why the raw value doesn't self-scale with dataset size) so the much
+# larger sample is actually allowed to move weights away from the prior;
+# this is what fixed the previous tune's clamped-near-zero mobility
+# weights (mob_knight_mg/mob_bishop_mg were 5 either way, but
+# mob_knight_eg was clamped from -1 to 0 -- now a real, comfortably
+# positive 8, not just "not negative").
+#
+# Three tuner outputs still came back negative and were clamped to 0
+# before shipping, same policy as the first pass: mob_queen_mg (-2),
+# king_shield_mg (-4), king_castled_mg (-1). The first is "more mobility
+# is bad," already established as not something a dataset gets to
+# overrule regardless of size; the latter two are worse -- a shielded or
+# actually-castled king scoring as LESS safe than an unshielded,
+# uncastled one is chess-nonsensical, and given how small all three
+# magnitudes are (comfortably inside noise), reads as leftover
+# collinearity between the king-safety sub-features rather than real
+# signal. Left un-clamped: rook_open_eg (-13), a small enough magnitude
+# on a weakly-informative endgame feature that a real "file control
+# matters less once rook activity comes from king/pawn proximity
+# instead" effect is plausible, unlike the three above.
 _TEXEL_TUNED = os.environ.get("CB_NB_TEXEL_TUNED", "1") != "0"
 
 # Passed-pawn bonus by relative rank (0 = own back rank, 7 = the square
 # it'd promote from -- unreachable for a pawn still on the board, kept
 # at 0 for safety).
 if _TEXEL_TUNED:
-    PASSED_PAWN_BONUS_MG = np.array([0, 3, 6, 20, 32, 56, 96, 0], dtype=np.int64)
-    PASSED_PAWN_BONUS_EG = np.array([0, 8, 13, 34, 54, 91, 145, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_MG = np.array([0, 8, 8, 2, 19, 40, 88, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_EG = np.array([0, 58, 48, 67, 93, 153, 188, 0], dtype=np.int64)
 else:
     PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
     PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
@@ -136,16 +177,18 @@ LAZY_EVAL_MARGIN = 250
 
 # King-to-passed-pawn race bonus (2026-09, endgame pass): per unit of
 # (enemy king's Chebyshev distance to the pawn's promotion square minus
-# our own king's distance to it), EG-only. Not part of CB_NB_TEXEL_TUNED
-# (added after that tune ran, and it's a new term rather than a
-# retuned existing one) -- still Texel-tuning-pending like everything
-# else here, but a real, well-established endgame term with no weight
-# at all is a bigger gap than an imperfectly-weighted one.
-KING_PAWN_PROXIMITY_WEIGHT_EG = 5
+# our own king's distance to it), EG-only. Was added after the first
+# Texel pass ran, so it shipped un-tuned (a flat 5) for one round; now
+# folded into CB_NB_TEXEL_TUNED like every other term now that
+# ratings/texel_features.py extracts it too.
+if _TEXEL_TUNED:
+    KING_PAWN_PROXIMITY_WEIGHT_EG = 15
+else:
+    KING_PAWN_PROXIMITY_WEIGHT_EG = 5
 
 if _TEXEL_TUNED:
-    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 11, 32
-    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 15, 18
+    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 26, 11
+    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 15, 30
 else:
     ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
     DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
@@ -155,8 +198,8 @@ else:
 # attacking asset; smaller in the endgame, where rook activity tends to
 # come from king/pawn proximity more than file control.
 if _TEXEL_TUNED:
-    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 14, 2
-    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 21, 13
+    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 72, -13
+    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 31, 19
 else:
     ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
     ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
@@ -165,7 +208,7 @@ else:
 # than the sum of two same-colour minor pieces, especially as the board
 # opens up in the endgame.
 if _TEXEL_TUNED:
-    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 16, 29
+    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 52, 51
 else:
     BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
 
@@ -191,13 +234,24 @@ else:
 _KING_SAFETY_V2 = os.environ.get("CB_NB_KING_SAFETY_V2", "1") != "0"
 
 if _KING_SAFETY_V2 and _TEXEL_TUNED:
+    # king_shield_mg and king_castled_mg came back negative from the
+    # retune (-4, -1) -- a shielded or actually-castled king scoring as
+    # LESS safe than the alternative is chess-nonsensical, and the
+    # magnitudes are small enough (well inside noise) to read as
+    # collinearity between the king-safety sub-features rather than a
+    # real effect. Rather than clamp to 0 (making the term fully inert),
+    # these two specifically fall back to the previous tune's values --
+    # not the hand-set original, the ones already validated by a real
+    # ladder loss (round 4: no castling, wrecked kingside shield, exposed
+    # queenside push) that this exact retune would otherwise silently
+    # erase evidence for. See the CB_NB_TEXEL_TUNED comment above.
     KING_SHIELD_PENALTY_MG = 26
-    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 1
-    KING_OPEN_FILE_PENALTY_MG = 35
-    KING_SEMI_OPEN_FILE_PENALTY_MG = 20
-    KING_ATTACKER_PENALTY_PER_UNIT_MG = 12
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 6
+    KING_OPEN_FILE_PENALTY_MG = 60
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 11
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 8
     CASTLED_BONUS_MG = 33
-    UNCASTLED_EXPOSED_PENALTY_MG = 37
+    UNCASTLED_EXPOSED_PENALTY_MG = 52
 elif _KING_SAFETY_V2:
     KING_SHIELD_PENALTY_MG = 25  # per missing pawn in the 3-square shield in front of the king
     # Extra shield penalty per missing pawn, scaled by how much attacking
@@ -249,11 +303,14 @@ ATTACKING_MATERIAL_ROOK_UNITS = 1
 # would overweight them relative to how much any one extra square
 # actually matters.
 if _TEXEL_TUNED:
-    # mob_rook_mg/mob_queen_mg/mob_knight_eg came back slightly negative
-    # from the tune (-5, -4, -1) -- clamped to 0 rather than shipped
-    # negative, see the CB_NB_TEXEL_TUNED comment above.
-    MOBILITY_UNIT_MG = np.array([0, 5, 5, 0, 0, 0], dtype=np.int64)
-    MOBILITY_UNIT_EG = np.array([0, 0, 7, 7, 18, 0], dtype=np.int64)
+    # mob_queen_mg came back slightly negative from the retune (-2) --
+    # clamped to 0 rather than shipped negative, see the
+    # CB_NB_TEXEL_TUNED comment above ("more mobility is bad" isn't
+    # something a dataset gets to overrule regardless of size).
+    # mob_rook_mg is genuinely 0, not clamped -- that's what the tune
+    # returned directly.
+    MOBILITY_UNIT_MG = np.array([0, 12, 8, 0, 0, 0], dtype=np.int64)
+    MOBILITY_UNIT_EG = np.array([0, 8, 7, 15, 24, 0], dtype=np.int64)
 else:
     MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
     MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)

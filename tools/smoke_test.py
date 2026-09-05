@@ -1,6 +1,6 @@
 """Replicates the validation harness's smoke checks:
 
-  1. Fresh import + init well under the 60 s init budget.
+  1. Fresh import + init well under the 90 s init budget.
   2. One full game as each colour against a baseline opponent.
   3. Every move returned was legal (a crash or illegal move ends the game
      as a loss for that side — this test asserts that never happens to us,

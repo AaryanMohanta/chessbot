@@ -31,8 +31,11 @@ from __future__ import annotations
 import dataclasses
 
 # One-time budget for process start + engine init (weight loading, warmup),
-# spent before the per-move clock begins. Not consumed by budget().
-INIT_BUDGET_MS = 60_000
+# spent before the per-move clock begins. Not consumed by budget(). Raised
+# 60_000 -> 90_000 (2026-09) per the competition rules update; real ladder
+# hardware compiles in ~28-33s either way, so this mainly widens the
+# margin before a legitimate compile is ever mistaken for a hang.
+INIT_BUDGET_MS = 90_000
 
 DEFAULT_INCREMENT_MS = 500
 

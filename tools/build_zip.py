@@ -38,6 +38,7 @@ SHIPPED_PY_FILES = [
     "cb_tt.py",
     "cb_nb_tables.py",
     "cb_nb_fast.py",
+    "cb_nb_pst_tuned.py",
     "cb_nb_search.py",
     "cb_nb_engine.py",
     "cb_book.py",
