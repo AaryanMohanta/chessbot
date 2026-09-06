@@ -45,6 +45,11 @@ def snapshot_version(tag: str, notes: str = "") -> Path:
         raise FileExistsError(f"zoo tag already exists: {tag} ({dest})")
 
     errors: list[str] = []
+    # Zoo tags and build tags (see cb_build_tag.py) are the same kind of
+    # thing -- "which config is this" -- so a zoo snapshot's build tag
+    # defaults to its own zoo tag rather than falling back to the git-SHA
+    # default build() would otherwise pick.
+    build_zip.generate_build_tag_file(tag, {})
     build_zip.check_imports(build_zip.SHIPPED_PY_FILES, errors)
     build_zip.check_filename_shadowing(build_zip.SHIPPED_PY_FILES, errors)
     shipped_paths = [REPO_ROOT / f for f in build_zip.SHIPPED_PY_FILES if (REPO_ROOT / f).exists()]

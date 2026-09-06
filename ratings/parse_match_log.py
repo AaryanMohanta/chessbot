@@ -33,6 +33,7 @@ _BG_WARMUP_RE = re.compile(
     r"^\[cb_nb_engine\] background warmup finished after (?P<ms>[\d.]+) ms \(numba_failed=(?P<failed>True|False)\)$",
     re.MULTILINE,
 )
+_BUILD_TAG_RE = re.compile(r"^\[agent\] build_tag=(?P<tag>\S+)$", re.MULTILINE)
 
 
 @dataclass
@@ -83,6 +84,15 @@ def parse_init(log_text: str) -> InitRecord | None:
         total_ms=float(m["ms"]), status=m["status"],
         ready_before_move1=(m["ready"] == "True"), stage_times_ms=stages,
     )
+
+
+def parse_build_tag(log_text: str) -> str | None:
+    """Which build/config produced this log (see agent.py's startup line
+    and tools/build_zip.py's --tag), or None if the line isn't present --
+    true for any log predating this instrumentation, and harmless: the
+    caller just can't attribute that game to a build."""
+    m = _BUILD_TAG_RE.search(log_text)
+    return m["tag"] if m else None
 
 
 def parse_background_warmup(log_text: str) -> tuple[float, bool] | None:
@@ -146,6 +156,7 @@ def parse_log_file(path: Path) -> dict:
     moves = parse_moves(text)
     init = parse_init(text)
     report = report_from_moves(moves, init)
+    report["build_tag"] = parse_build_tag(text)
     report["file"] = str(path)
     return report
 

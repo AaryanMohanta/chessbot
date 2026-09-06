@@ -46,6 +46,22 @@ _PROCESS_START = time.monotonic()  # first line, before any other import --
 
 import chess
 
+try:
+    from cb_build_tag import BUILD_TAG  # noqa: E402 -- see that (generated) file's own docstring
+except Exception:
+    BUILD_TAG = "unknown"
+
+# Logged unconditionally, before any of the try/except layers below --
+# this line has to survive even a total engine failure, since it's what
+# lets a real ladder game's log be attributed to the config that produced
+# it (see ratings/parse_match_log.py's parse_build_tag and
+# ratings/ladder_db.py). Also: importing cb_build_tag above (not just
+# reading BUILD_TAG off it) is what applies any FLAG_OVERRIDES it carries
+# to os.environ, and that has to happen before cb_nb_engine is imported
+# below, since cb_nb_search.py reads its CB_NB_* flags from the
+# environment at import time.
+print(f"[agent] build_tag={BUILD_TAG}", file=sys.stderr, flush=True)
+
 
 def _log_layer_failure(layer_name: str) -> None:
     """Every fallback layer below silently swallows its own exception on

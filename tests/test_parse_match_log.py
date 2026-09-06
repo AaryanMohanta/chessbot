@@ -5,9 +5,10 @@ before this instrumentation existed (no move lines at all) rather than
 raising, since real ladder logs from before this change will still be
 in the pipeline.
 """
-from ratings.parse_match_log import parse_init, parse_moves, report_from_moves
+from ratings.parse_match_log import parse_build_tag, parse_init, parse_moves, report_from_moves
 
 _SAMPLE_LOG = """\
+[agent] build_tag=abc1234
 [cb_engine] init took 1.7 ms (budget 90000 ms)
 [cb_engine] init took 1.7 ms (budget 90000 ms)
 [cb_nb_engine] init returned after 40000.0 ms (fully warm) ready_before_move1=True stages: stage_movegen=5000ms stage_eval_zobrist=3500ms stage_search=28000ms stage_cpu_warmup=3500ms
@@ -54,6 +55,14 @@ def test_report_detects_a_depth_collapse():
     # ply=3 (depth 2) sits between two depth-9 searches -- a clear collapse
     collapsed_plies = [c[0] for c in report["depth_collapses"]]
     assert 3 in collapsed_plies
+
+
+def test_parse_build_tag_extracts_the_tag():
+    assert parse_build_tag(_SAMPLE_LOG) == "abc1234"
+
+
+def test_parse_build_tag_returns_none_when_absent():
+    assert parse_build_tag("no build tag line here\nmv ply=0 layer=book d=- sc=- n=- t=0.00s left=120.0s") is None
 
 
 def test_gracefully_handles_a_pre_instrumentation_log():
