@@ -42,12 +42,30 @@ SHIPPED_PY_FILES = [
     "cb_nb_search.py",
     "cb_nb_engine.py",
     "cb_book.py",
+    "cb_tb.py",
 ]
 
 # Explicit, not a glob, same reasoning as SHIPPED_PY_FILES above -- named
 # individually even though it's the only one today.
 SHIPPED_DATA_FILES = [
     "cb_book.bin",
+]
+
+# The 3-4 man Syzygy WDL set (2026-09, see cb_tb.py) -- kept under
+# syzygy/ in the dev repo for organization, but written flat at the zip
+# root below like every other shipped file (cb_tb.py's own directory
+# search checks both layouts). Explicit list, not a glob over the
+# directory, for the same "deliberate act" reasoning as the .py whitelist
+# above -- and because it doubles as documentation of exactly which 35
+# material combinations are covered.
+SHIPPED_TABLEBASE_FILES = [
+    "KBBvK.rtbw", "KBNvK.rtbw", "KBPvK.rtbw", "KBvK.rtbw", "KBvKB.rtbw",
+    "KBvKN.rtbw", "KBvKP.rtbw", "KNNvK.rtbw", "KNPvK.rtbw", "KNvK.rtbw",
+    "KNvKN.rtbw", "KNvKP.rtbw", "KPPvK.rtbw", "KPvK.rtbw", "KPvKP.rtbw",
+    "KQBvK.rtbw", "KQNvK.rtbw", "KQPvK.rtbw", "KQQvK.rtbw", "KQRvK.rtbw",
+    "KQvK.rtbw", "KQvKB.rtbw", "KQvKN.rtbw", "KQvKP.rtbw", "KQvKQ.rtbw",
+    "KQvKR.rtbw", "KRBvK.rtbw", "KRNvK.rtbw", "KRPvK.rtbw", "KRRvK.rtbw",
+    "KRvK.rtbw", "KRvKB.rtbw", "KRvKN.rtbw", "KRvKP.rtbw", "KRvKR.rtbw",
 ]
 
 # Weight files are optional and picked up automatically if present at repo
@@ -152,9 +170,16 @@ def build(output_path: Path = DEFAULT_OUTPUT) -> None:
     check_imports(SHIPPED_PY_FILES, errors)
     check_filename_shadowing(SHIPPED_PY_FILES, errors)
 
+    for filename in SHIPPED_TABLEBASE_FILES:
+        if not (REPO_ROOT / "syzygy" / filename).exists():
+            errors.append(f"missing shipped tablebase file: syzygy/{filename}")
+
     weight_files = discover_weight_files()
     data_files = [REPO_ROOT / f for f in SHIPPED_DATA_FILES]
-    shipped_paths = [REPO_ROOT / f for f in SHIPPED_PY_FILES] + data_files + weight_files
+    tablebase_files = [REPO_ROOT / "syzygy" / f for f in SHIPPED_TABLEBASE_FILES]
+    shipped_paths = (
+        [REPO_ROOT / f for f in SHIPPED_PY_FILES] + data_files + tablebase_files + weight_files
+    )
     existing_paths = [p for p in shipped_paths if p.exists()]
 
     check_forbidden_files(existing_paths, errors)

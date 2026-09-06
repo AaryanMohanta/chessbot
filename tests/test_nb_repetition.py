@@ -117,13 +117,23 @@ def test_winning_move_scores_positive_when_not_a_repeat():
     assert score > 100  # White is up a whole queen with a bare enemy king
 
 
-def test_same_move_scores_exactly_zero_when_its_result_is_a_known_repeat():
+def test_same_move_scores_below_zero_for_the_winning_side_when_it_is_a_known_repeat():
+    """Pre-contempt (2026-09) this scored exactly 0 -- see the module
+    docstring. Contempt (see ENABLE_CONTEMPT in cb_nb_search.py) now
+    scales the draw score by the mover's own static eval at the
+    repetition node: here the mover-after-White's-move is Black, down a
+    whole queen, so Black's contempt-adjusted "draw" is capped at
+    +CONTEMPT_EVAL_CAP*CONTEMPT_SCALE = +45 from Black's own
+    perspective -- which negates back to -45 from White's perspective,
+    exactly the desired effect (a won queen endgame thrown away by
+    repetition should score clearly worse than 0 for the winning side,
+    not as a neutral wash)."""
     arrays = s.SearchArrays()
     repeated_key = _key_after(_KQK_FEN, "d5", "d4")
     arrays.record_game_position(repeated_key)
     legal, score = _try_move(_KQK_FEN, "d5", "d4", arrays)
     assert legal is True
-    assert score == 0
+    assert score == -45
 
 
 def test_a_different_move_is_unaffected_by_an_unrelated_repeat_entry():
@@ -145,3 +155,46 @@ def test_record_game_position_accumulates_across_calls():
     assert arrays.game_history_count == 2
     assert arrays.game_history_keys[0] == 1
     assert arrays.game_history_keys[1] == 2
+
+
+# -- _contempt_draw_score: direct, hand-picked FENs ----------------------
+# Assumes ENABLE_CONTEMPT's default-on setting (CB_NB_ENABLE_CONTEMPT unset
+# or != "0"); the njit function bakes ENABLE_CONTEMPT in as a compile-time
+# global, so it can't be toggled per-test the way a plain constant could.
+
+def _contempt_for_fen(fen):
+    pieces, mailbox, meta = f.fen_to_state(fen)
+    eval_state = np.zeros(3, dtype=np.int64)
+    mg, eg, phase = f.compute_eval_state(pieces)
+    eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
+    return s._contempt_draw_score(
+        pieces, mailbox, meta, eval_state,
+        _T.rook_masks, _T.rook_magics, _T.rook_shifts, _T.rook_offsets, _T.rook_table,
+        _T.bishop_masks, _T.bishop_magics, _T.bishop_shifts, _T.bishop_offsets, _T.bishop_table,
+        _T.knight_attacks, _T.king_attacks,
+    )
+
+
+def test_contempt_is_positive_when_mover_is_clearly_losing():
+    # Black to move, down a whole queen -- a draw should look attractive.
+    score = _contempt_for_fen("7k/8/8/3Q4/8/8/8/4K3 b - - 0 1")
+    assert score > 0
+
+
+def test_contempt_is_negative_when_mover_is_clearly_winning():
+    # White to move, up a whole queen -- a draw should look unattractive.
+    score = _contempt_for_fen("7k/8/8/3Q4/8/8/8/4K3 w - - 0 1")
+    assert score < 0
+
+
+def test_contempt_is_small_near_the_starting_position():
+    score = _contempt_for_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert abs(score) < 50
+
+
+def test_contempt_is_capped_at_extreme_material_imbalance():
+    # White up two queens and a rook: static eval is far past
+    # CONTEMPT_EVAL_CAP in magnitude, so the offset must clamp rather
+    # than keep growing with how far ahead/behind the mover is.
+    score = _contempt_for_fen("7k/3Q4/8/3Q4/3R4/8/8/4K3 w - - 0 1")
+    assert score == -int(s.CONTEMPT_SCALE * s.CONTEMPT_EVAL_CAP)

@@ -12,17 +12,20 @@ Layered fallback, each layer independent of the ones "above" it and each
 layer's answer independently re-verified legal before being trusted:
 
   1. cb_book: an instant, no-search Polyglot opening-book probe.
-  2. cb_nb_engine.Engine: the numba bitboard search. Its own __init__
+  2. cb_tb: an instant, no-search Syzygy 3-4 man WDL tablebase probe
+     (2026-09) -- authoritative whenever it applies (<=4 pieces left), so
+     it's tried before the search layers rather than after them.
+  3. cb_nb_engine.Engine: the numba bitboard search. Its own __init__
      already blocks compiling (up to a wall-clock deadline) then falls
      back to serving from v1 in the background if that deadline is hit
      -- see cb_nb_engine.py -- so this layer alone already degrades
      gracefully under a slow or failed compile.
-  3. cb_engine.Engine (v1, python-chess): constructed independently here
+  4. cb_engine.Engine (v1, python-chess): constructed independently here
      as well, not just reached via layer 2's internal fallback -- so a
      bug in cb_nb_engine's own wrapper code (not the numba compile
      itself, which layer 2 already isolates) still can't take v1 down
      with it.
-  4. _fallback_move: first legal move python-chess enumerates. Depends
+  5. _fallback_move: first legal move python-chess enumerates. Depends
      on nothing but ``chess``, so it's as close to "obviously correct" as
      a fallback can be without reimplementing chess rules from scratch.
 
@@ -66,6 +69,12 @@ try:
 except Exception:
     _log_layer_failure("cb_book")
     cb_book = None
+
+try:
+    import cb_tb
+except Exception:
+    _log_layer_failure("cb_tb")
+    cb_tb = None
 
 _v1 = None
 try:
@@ -138,23 +147,60 @@ def _log_move_failure(layer_name: str) -> None:
     sys.stderr.flush()
 
 
+def _log_move(ply: int, layer: str, depth, score, nodes, elapsed_ms: float, time_left_ms: int) -> None:
+    """One compact stderr line per move (2026-09, per the updated rules'
+    8KB-per-game log: first 4KB + last 4KB, PGN shown alongside on the
+    dashboard). Deliberately terse and single-line -- with truncation
+    keeping only the opening and the endgame, a verbose or multi-line
+    format would fit far fewer real moves into that budget. Fixed,
+    short field names (not a natural-language sentence) so a parser can
+    pull these into the ratings database alongside the PGN: ply, which
+    layer actually answered (book/tb/numba/v1/trivial -- numba's own
+    last_layer distinguishes an internal v1 fallback from a real numba
+    answer, see cb_nb_engine.Engine.get_move), search depth reached,
+    score (mover's POV, centipawns), node count, wall-clock time spent
+    on this decision, and the time_left_ms this decision was actually
+    made against (not the value after -- the wire protocol doesn't tell
+    us the increment, so this is the honest number to log)."""
+    d = "-" if depth is None else str(depth)
+    sc = "-" if score is None else f"{score:+.0f}"
+    n = "-" if nodes is None else str(nodes)
+    print(f"mv ply={ply} layer={layer} d={d} sc={sc} n={n} t={elapsed_ms/1000:.2f}s left={time_left_ms/1000:.1f}s",
+          file=sys.stderr, flush=True)
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     global _last_score
     _last_score = None
+    ply = chess.Board(fen).ply()
+    move_start = time.perf_counter()
 
     if cb_book is not None:
         try:
             move = cb_book.probe(fen)
             if move is not None and _is_legal(fen, move):
+                _log_move(ply, "book", None, None, None, (time.perf_counter() - move_start) * 1000, time_left_ms)
                 return move
         except Exception:
             _log_move_failure("cb_book")
+
+    if cb_tb is not None:
+        try:
+            move = cb_tb.probe(fen)
+            if move is not None and _is_legal(fen, move):
+                _log_move(ply, "tb", None, None, None, (time.perf_counter() - move_start) * 1000, time_left_ms)
+                return move
+        except Exception:
+            _log_move_failure("cb_tb")
 
     if _engine is not None:
         try:
             move = _engine.get_move(fen, time_left_ms)
             if move is not None and _is_legal(fen, move):
                 _last_score = getattr(_engine, "last_score", None)
+                layer = getattr(_engine, "last_layer", None) or "numba"
+                _log_move(ply, layer, getattr(_engine, "last_depth", None), _last_score,
+                           getattr(_engine, "last_nodes", None), (time.perf_counter() - move_start) * 1000, time_left_ms)
                 return move
         except Exception:
             _log_move_failure("cb_nb_engine (numba)")
@@ -164,8 +210,12 @@ def get_move(fen: str, time_left_ms: int) -> str:
             move = _v1.get_move(fen, time_left_ms)
             if move is not None and _is_legal(fen, move):
                 _last_score = getattr(_v1, "last_score", None)
+                _log_move(ply, "v1", getattr(_v1, "last_depth", None), _last_score,
+                           getattr(_v1, "last_nodes", None), (time.perf_counter() - move_start) * 1000, time_left_ms)
                 return move
         except Exception:
             _log_move_failure("cb_engine (v1)")
 
-    return _fallback_move(fen)
+    move = _fallback_move(fen)
+    _log_move(ply, "trivial", None, None, None, (time.perf_counter() - move_start) * 1000, time_left_ms)
+    return move

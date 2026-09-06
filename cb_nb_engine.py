@@ -61,6 +61,7 @@ import numpy as np
 import cb_engine
 import cb_nb_fast as F
 import cb_nb_search as S
+from cb_time import INIT_BUDGET_MS
 
 _WARMUP_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
@@ -76,11 +77,25 @@ _WARMUP_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 # the opening moves" the same way the old 40s/60s pair did.
 COMPILE_DEADLINE_S = 70.0
 
+# Safety margin (seconds) _stage_cpu_warmup keeps against the real 90s
+# init budget when sizing itself to fill whatever's left -- separate from
+# COMPILE_DEADLINE_S's own margin since this stage runs strictly after
+# compilation already succeeded, so it can safely use more of the gap
+# between 70s and 90s than the compile stages themselves are trusted with.
+_CPU_WARMUP_SAFETY_S = 10.0
+
 
 class Engine:
     def __init__(self, process_start: float | None = None) -> None:
         start = time.monotonic()
-        self._deadline = (process_start if process_start is not None else start) + COMPILE_DEADLINE_S
+        origin = process_start if process_start is not None else start
+        self._deadline = origin + COMPILE_DEADLINE_S
+        # The real hard cutoff (2026-09): used only by _stage_cpu_warmup to
+        # size itself against whatever's actually left of the real 90s
+        # budget, not the more conservative 70s compile deadline above --
+        # this stage isn't compiling anything, so it can safely use the
+        # margin between the two.
+        self._init_budget_deadline = origin + INIT_BUDGET_MS / 1000
 
         # v1 is both the immediate-availability fallback during warmup and
         # the permanent fallback if numba never becomes ready. It owns its
@@ -93,20 +108,34 @@ class Engine:
         self._numba_ready = threading.Event()
         self._numba_failed = False
         self.last_score: float | None = None  # centipawns, mover's perspective -- diagnostic only, see harness.match
+        self.last_depth: int | None = None  # diagnostic only, see agent.py's per-move stderr log
+        self.last_nodes: int | None = None
+        self.last_layer: str | None = None  # "numba" or "v1", whichever path actually produced the last move
+        self._stage_times_ms: list[tuple[str, float]] = []
 
         stages_done = self._compile_blocking()
+        ready_before_move1 = False
         if self._numba_failed:
             self._numba_ready.set()
             status = "compile failed, permanently using v1"
         elif stages_done >= len(self._STAGES):
             self._numba_ready.set()
             status = "fully warm"
+            ready_before_move1 = True
         else:
             threading.Thread(target=self._warm_up_remaining, args=(stages_done,), daemon=True).start()
             status = f"deadline hit after stage {stages_done}/{len(self._STAGES)}, finishing in background"
 
         init_ms = (time.monotonic() - start) * 1000
-        print(f"[cb_nb_engine] init returned after {init_ms:.1f} ms ({status})", file=sys.stderr)
+        # Terse, parseable per-stage breakdown (2026-09 telemetry) --
+        # short names so this stays legible inside the 8KB-per-game log's
+        # first-4KB slice alongside everything else that happens at
+        # init. ready_before_move1 is the direct answer to "did numba
+        # ever get a chance to play the opening" without having to infer
+        # it from the status string.
+        stage_summary = " ".join(f"{name.lstrip('_')}={ms:.0f}ms" for name, ms in self._stage_times_ms)
+        print(f"[cb_nb_engine] init returned after {init_ms:.1f} ms ({status}) "
+              f"ready_before_move1={ready_before_move1} stages: {stage_summary}", file=sys.stderr)
 
     def _stage_movegen(self) -> None:
         """Stage 1 (highest priority): movegen + make/unmake, and the
@@ -170,9 +199,21 @@ class Engine:
         Deliberately last in _STAGES: if the deadline is already tight
         after the compile stages, this is what gets deferred to the
         background thread instead, at zero extra risk to the stages that
-        actually matter."""
+        actually matter.
+
+        Budget (2026-09 retest): fills whatever's actually left of the
+        real 90s init budget, not a fixed few seconds -- compile alone
+        typically leaves ~30-50s completely idle, and none of it costs
+        real game-clock time either way, so there's no reason to leave
+        most of it on the table. _CPU_WARMUP_SAFETY_S keeps a hard
+        buffer against the 90s cutoff (this stage's own timing checks are
+        wall-clock-based like every other search call, not perfectly
+        exact) rather than trusting the arithmetic down to the second."""
+        remaining_s = self._init_budget_deadline - time.monotonic() - _CPU_WARMUP_SAFETY_S
+        if remaining_s <= 0:
+            return
         warmup_arrays = S.SearchArrays()
-        S.search(_WARMUP_FEN, soft_ms=3_000, hard_ms=5_000, arrays=warmup_arrays)
+        S.search(_WARMUP_FEN, soft_ms=remaining_s * 1000, hard_ms=remaining_s * 1000, arrays=warmup_arrays)
 
     _STAGES = (_stage_movegen, _stage_eval_zobrist, _stage_search, _stage_cpu_warmup)
 
@@ -180,13 +221,19 @@ class Engine:
         """Runs one compile stage. Returns False (and marks the numba
         path permanently failed) if it raises -- callers must stop
         attempting further stages, blocking or background, once this
-        returns False."""
+        returns False. Records its own wall-clock time in
+        self._stage_times_ms (2026-09, per-stage init telemetry) whether
+        it succeeds or fails, since a slow FAILING stage is exactly the
+        case worth seeing in the log."""
+        t0 = time.monotonic()
         try:
             stage_fn(self)
             return True
         except Exception:
             self._numba_failed = True
             return False
+        finally:
+            self._stage_times_ms.append((stage_fn.__name__, (time.monotonic() - t0) * 1000))
 
     def _compile_blocking(self) -> int:
         """Runs stages in priority order until either all finish or the
@@ -211,6 +258,7 @@ class Engine:
         hit -- finishes whatever stages didn't make it in before init
         returned. get_move keeps serving from v1 until this sets
         _numba_ready."""
+        t0 = time.monotonic()
         try:
             for stage_fn in self._STAGES[stages_done:]:
                 if self._numba_failed:
@@ -219,6 +267,13 @@ class Engine:
                     return
         finally:
             self._numba_ready.set()
+            # 2026-09 telemetry: v1 serves however many real moves land
+            # between init returning and this firing -- worth its own
+            # line since the main init line's ready_before_move1=False
+            # only says numba WASN'T ready at move 1, not when (or
+            # whether) it ever became ready at all.
+            print(f"[cb_nb_engine] background warmup finished after {(time.monotonic() - t0) * 1000:.1f} ms "
+                  f"(numba_failed={self._numba_failed})", file=sys.stderr)
 
     def get_move(self, fen: str, time_left_ms: int) -> str:
         """Raises on any internal failure, same contract as cb_engine.Engine
@@ -229,6 +284,9 @@ class Engine:
         else:
             move = self._v1.get_move(fen, time_left_ms)
             self.last_score = self._v1.last_score
+            self.last_depth = self._v1.last_depth
+            self.last_nodes = self._v1.last_nodes
+            self.last_layer = "v1"  # internal fallback -- agent.py's own layer name stays "numba" either way
         return move
 
     def _get_move_numba(self, fen: str, time_left_ms: int) -> str:
@@ -240,8 +298,11 @@ class Engine:
         self._arrays.record_game_position(key)
 
         self._generation += 1
-        move, score, _info = S.search(
+        move, score, info = S.search(
             fen, budget.soft_ms, budget.hard_ms, self._arrays, self._generation,
         )
         self.last_score = score
+        self.last_depth = info["depth"]
+        self.last_nodes = info["nodes"]
+        self.last_layer = "numba"
         return F.move_to_uci(move)

@@ -96,6 +96,24 @@ ENABLE_LMR_DEPTH_SCALING = os.environ.get("CB_NB_ENABLE_LMR_DEPTH_SCALING", "0")
 LMR_DEEP_DEPTH = 6
 LMR_DEEP_EXTRA_REDUCTION = 1
 
+# Contempt (2026-09, the 600-ply-draw rule change): a repetition draw
+# used to be strictly worse than almost any alternative when losing
+# (the position would otherwise run to the 300-ply material-adjudication
+# cutoff and lose outright) -- now a draw reached by ply 600 is a real
+# half point regardless of material, so a draw score of exactly 0
+# undersells it when we're clearly worse and oversells it when we're
+# clearly better. Signed offset scaled by the mover's own current static
+# eval at the point a repetition is found: negative eval (mover worse)
+# pushes the draw score up (more attractive, encourages steering into or
+# accepting the repeat); positive eval (mover better) pushes it down
+# (less attractive, encourages playing on rather than settling).
+# CONTEMPT_EVAL_CAP bounds how much a single very lopsided position can
+# swing this -- past a few pawns down, "more losing" shouldn't make a
+# draw progressively more attractive than it already is at the cap.
+ENABLE_CONTEMPT = os.environ.get("CB_NB_ENABLE_CONTEMPT", "1") != "0"
+CONTEMPT_SCALE = 0.15
+CONTEMPT_EVAL_CAP = 300
+
 ENABLE_ASPIRATION = os.environ.get("CB_NB_ENABLE_ASPIRATION", "1") != "0"
 
 # Aspiration windows (2026-09, design doc sec.5): from ASPIRATION_MIN_DEPTH
@@ -158,7 +176,17 @@ LMP_MAX_DEPTH = 3
 def _lmp_quiet_limit(depth):
     return 4 + depth * depth
 
-TT_SIZE_BITS = 20
+# TT_SIZE_BITS retest (2026-09): each entry is 6 separate int64/uint64
+# arrays (keys, depths, scores, bounds, moves, generations) -- 48 bytes/
+# entry, not a packed struct -- so 2^20 is ~50MB and 2^23 is ~403MB,
+# comfortably inside the 2GB budget either way. At ~1M nps and a
+# multi-second move budget, a single move alone can generate several
+# million node visits against a 2^20 (~1.05M entry) table, thrashing
+# replacement within one move, before even counting that the table
+# persists and accumulates across the whole game. Env-var override
+# (matching every other tunable flag in this file) so the two sizes are
+# SPRT-testable against each other rather than just asserted better.
+TT_SIZE_BITS = int(os.environ.get("CB_NB_TT_SIZE_BITS", "20"))
 TT_SIZE = 1 << TT_SIZE_BITS
 TT_MASK = TT_SIZE - 1
 BOUND_EXACT, BOUND_LOWER, BOUND_UPPER = 0, 1, 2
@@ -316,6 +344,29 @@ def _is_repetition(key, ply, path_keys, game_history_keys, game_history_count):
         if game_history_keys[i] == key:
             return True
     return False
+
+
+@njit(cache=False)
+def _contempt_draw_score(pieces, mailbox, meta, eval_state,
+                          rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                          bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                          knight_attacks, king_attacks):
+    """The draw score for a detected repetition, adjusted by contempt --
+    see ENABLE_CONTEMPT's comment above. Returns 0 outright when contempt
+    is disabled, matching the pre-2026-09 behavior exactly. mailbox is
+    unused but kept for signature symmetry with the other node-local
+    helpers that take a full board-state parameter list."""
+    if not ENABLE_CONTEMPT:
+        return 0
+    color = meta[0]
+    static_eval = F.evaluate_from_state(
+        eval_state, color, pieces, meta[1], -1_000_000, 1_000_000,
+        rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+        bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+        knight_attacks, king_attacks,
+    )
+    capped = min(max(static_eval, -CONTEMPT_EVAL_CAP), CONTEMPT_EVAL_CAP)
+    return np.int64(-CONTEMPT_SCALE * capped)
 
 
 @njit(numba.int64(numba.int64, numba.int64), cache=False)
@@ -831,7 +882,12 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     # key would be wrong to reuse from a different line where the same
     # position isn't a repeat at all.
     if _is_repetition(key, ply, path_keys, game_history_keys, game_history_count):
-        return 0
+        return _contempt_draw_score(
+            pieces, mailbox, meta, eval_state,
+            rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+            bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+            knight_attacks, king_attacks,
+        )
     path_keys[ply] = key
     found, tt_depth, tt_score_raw, tt_bound, tt_move = tt_probe(key, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
     if not ENABLE_TT:
