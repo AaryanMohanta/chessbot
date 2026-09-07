@@ -214,3 +214,30 @@ def test_stays_legal_across_a_short_game_spanning_the_deadline_handoff(monkeypat
     _drain(engine)
     assert engine._numba_ready.is_set()
     assert not engine._numba_failed
+
+
+def test_real_unmocked_compile_succeeds_and_numba_actually_plays():
+    """Every test above fakes Engine._STAGES, which is exactly why a real
+    ladder loss (round 52) went undetected here: a plain argument-count
+    mismatch in _stage_eval_zobrist's real body (introduced alongside an
+    evaluate_from_state signature change, missed at this one call site)
+    made numba fail to compile every single time, with every mocked test
+    above still passing clean since none of them ever call the real
+    stage functions. tools/smoke_test.py had the same blind spot --
+    "no crash, legal moves" is exactly what a silent, permanent v1
+    fallback also produces.
+
+    This test pays the real ~30-70s compile cost specifically so a
+    signature mismatch like that one fails LOUDLY in the default test
+    suite instead of silently on the real ladder -- worth the added
+    runtime given what the alternative already cost once."""
+    engine = cb_nb_engine.Engine(process_start=time.monotonic())
+    assert not engine._numba_failed, "real numba compile failed -- see stderr for the traceback"
+    assert engine._numba_ready.is_set(), "real compile should finish well inside the test's own patience"
+
+    move = engine.get_move(STARTPOS, time_left_ms=30_000)
+    _assert_legal(STARTPOS, move)
+    assert engine.last_layer == "numba", (
+        f"get_move answered via {engine.last_layer!r}, not the real numba search -- "
+        "a silent fallback would still return a legal move, which is exactly the gap this test closes"
+    )

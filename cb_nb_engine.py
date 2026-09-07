@@ -54,6 +54,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import traceback
 
 import chess
 import numpy as np
@@ -164,7 +165,7 @@ class Engine:
             eval_state, meta[0], pieces, meta[1], -1_000_000, 1_000_000,
             t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
             t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-            t.knight_attacks, t.king_attacks,
+            t.knight_attacks, t.king_attacks, t.pawn_attacks,
         )
 
     def _stage_search(self) -> None:
@@ -224,13 +225,27 @@ class Engine:
         returns False. Records its own wall-clock time in
         self._stage_times_ms (2026-09, per-stage init telemetry) whether
         it succeeds or fails, since a slow FAILING stage is exactly the
-        case worth seeing in the log."""
+        case worth seeing in the log.
+
+        Prints the exception (2026-09, after a real ladder loss -- round
+        52 -- where a plain signature mismatch in a warmup call silently
+        fell back to v1 for an entire game with nothing in the log beyond
+        "compile failed": the fallback itself is the right behavior (a
+        crash mid-game would be worse), but a silently swallowed
+        exception meant the actual cause was invisible until this exact
+        line was tracked down by hand from the source. Every real match
+        log now carries enough to diagnose a compile failure without
+        needing to reproduce it locally first."""
         t0 = time.monotonic()
         try:
             stage_fn(self)
             return True
         except Exception:
             self._numba_failed = True
+            print(f"[cb_nb_engine] {stage_fn.__name__} failed to compile: "
+                  f"{sys.exc_info()[0].__name__}: {sys.exc_info()[1]}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
             return False
         finally:
             self._stage_times_ms.append((stage_fn.__name__, (time.monotonic() - t0) * 1000))
