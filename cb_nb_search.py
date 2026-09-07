@@ -30,6 +30,21 @@ import cb_nb_fast as F
 
 MATE_SCORE = 100_000
 MATE_THRESHOLD = MATE_SCORE - 1_000
+# search()'s iterative-deepening loop won't trust a mate-range score to
+# stop deepening until it's been found at at least this depth (2026-09,
+# after a real ladder loss -- round 53 -- where a completely won K+Q vs
+# K endgame drew by repetition: root_search's TT probe can return a
+# cached BOUND_EXACT score for the exact current position from an
+# earlier, deeper search -- a single depth-1 iteration hitting that
+# cache during a later, similar-looking position is not the same as
+# THIS move's search having verified the mate is still really there. The
+# match log showed depth collapsing to 1 (as few as 25-55 total nodes)
+# for essentially every move once a mate-range score first appeared, for
+# the rest of the game -- the early exit meant the search never got the
+# extra plies that might have caught the mistake or found real progress.
+# A few extra plies of search on an already-winning position is cheap
+# insurance against throwing the win away.
+MATE_FOUND_MIN_DEPTH = 4
 MAX_PLY = 128
 MAX_MOVES = F.MAX_MOVES
 
@@ -1519,7 +1534,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
 
         if now >= soft_deadline or now >= hard_deadline:
             break
-        if abs(best_score) >= MATE_THRESHOLD:
+        if abs(best_score) >= MATE_THRESHOLD and depth >= MATE_FOUND_MIN_DEPTH:
             break
 
         if prev_nodes is not None and prev_nodes > 0 and this_nodes > 0:
