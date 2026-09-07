@@ -25,7 +25,7 @@ def test_incremental_hash_and_eval_match_recompute_over_full_games():
 
     for game_idx in range(30):
         pieces, mailbox, meta = f.fen_to_state(STARTPOS)
-        zobrist = np.zeros(1, dtype=np.uint64)
+        zobrist = np.zeros(2, dtype=np.uint64)
         zobrist[0] = np.uint64(f.compute_hash(pieces, meta))
         eval_state = f.new_eval_state(pieces)
 
@@ -49,6 +49,43 @@ def test_incremental_hash_and_eval_match_recompute_over_full_games():
             assert tuple(eval_state) == f.compute_eval_state(pieces), f"game {game_idx}, eval_state after unmake_move {move}"
 
     assert total_checks > 1000  # sanity: the loop above actually ran
+
+
+def test_incremental_pawn_hash_matches_recompute_over_200_games():
+    """CorrHist (2026-09) keys its correction table off a pawn-only Zobrist
+    hash maintained incrementally through make/unmake alongside the main
+    key -- same discipline as the main hash's own consistency gate above,
+    at the larger sample size (200 games) the CorrHist plan calls for
+    specifically, since a pawn-hash bug would silently mis-key every
+    correction lookup rather than crash."""
+    rng = random.Random(2026)
+    total_checks = 0
+
+    for game_idx in range(200):
+        pieces, mailbox, meta = f.fen_to_state(STARTPOS)
+        zobrist = np.zeros(2, dtype=np.uint64)
+        zobrist[0] = np.uint64(f.compute_hash(pieces, meta))
+        zobrist[1] = np.uint64(f.compute_pawn_hash(pieces))
+        eval_state = f.new_eval_state(pieces)
+
+        history = []
+        for _ply in range(40):
+            legal = f.generate_legal_moves_simple(pieces, mailbox, meta)
+            if not legal:
+                break
+            move = rng.choice(legal)
+
+            undo = f.make_move_simple(pieces, mailbox, meta, move, zobrist, eval_state)
+            total_checks += 1
+            assert int(zobrist[1]) == f.compute_pawn_hash(pieces), f"game {game_idx}, pawn hash after make_move {move}"
+            history.append((move, undo))
+
+        for move, undo in reversed(history):
+            f.unmake_move_simple(pieces, mailbox, meta, move, undo, zobrist, eval_state)
+            total_checks += 1
+            assert int(zobrist[1]) == f.compute_pawn_hash(pieces), f"game {game_idx}, pawn hash after unmake_move {move}"
+
+    assert total_checks > 1000
 
 
 def test_material_pst_component_matches_v1_eval():

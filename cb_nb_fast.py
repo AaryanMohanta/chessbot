@@ -574,9 +574,14 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     push_dir = 8 if color == 0 else -8
 
     h = zobrist[0]
+    ph = zobrist[1]  # pawn-only hash (CorrHist, 2026-09) -- same random
+    # values as h's zobrist_piece table, XORed only for pawn bitboard
+    # changes; see pawn_zobrist_hash_from_scratch's own docstring.
     mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
 
     h ^= zobrist_piece[piece_idx, from_sq]
+    if piece_type == PAWN:
+        ph ^= zobrist_piece[piece_idx, from_sq]
     mg -= pst_mg[piece_idx, from_sq]
     eg -= pst_eg[piece_idx, from_sq]
     phase -= phase_weight[piece_idx]
@@ -589,6 +594,7 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
         pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(captured_square))
         mailbox[captured_square] = -1
         h ^= zobrist_piece[captured_idx, captured_square]
+        ph ^= zobrist_piece[captured_idx, captured_square]  # en passant always captures a pawn
         mg -= pst_mg[captured_idx, captured_square]
         eg -= pst_eg[captured_idx, captured_square]
         phase -= phase_weight[captured_idx]
@@ -599,6 +605,8 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
             undo_captured_square = to_sq
             pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(to_sq))
             h ^= zobrist_piece[captured_idx, to_sq]
+            if captured_idx % 6 == PAWN:
+                ph ^= zobrist_piece[captured_idx, to_sq]
             mg -= pst_mg[captured_idx, to_sq]
             eg -= pst_eg[captured_idx, to_sq]
             phase -= phase_weight[captured_idx]
@@ -610,6 +618,8 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     mailbox[from_sq] = -1
     mailbox[to_sq] = final_piece_idx
     h ^= zobrist_piece[final_piece_idx, to_sq]
+    if final_piece_type == PAWN:
+        ph ^= zobrist_piece[final_piece_idx, to_sq]
     mg += pst_mg[final_piece_idx, to_sq]
     eg += pst_eg[final_piece_idx, to_sq]
     phase += phase_weight[final_piece_idx]
@@ -663,6 +673,7 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     meta[3] = new_halfmove
     meta[4] = meta[4] + (1 if color == 1 else 0)
     zobrist[0] = h
+    zobrist[1] = ph
     eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
     return undo_castling_rights, undo_ep_square, undo_halfmove_clock, undo_captured_piece, undo_captured_square
@@ -698,9 +709,12 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     original_piece_idx = color * 6 + original_piece_type
 
     h = zobrist[0]
+    ph = zobrist[1]  # pawn-only hash (CorrHist, 2026-09) -- see make_move
     mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
 
     h ^= zobrist_piece[final_piece_idx, to_sq]
+    if final_piece_type == PAWN:
+        ph ^= zobrist_piece[final_piece_idx, to_sq]
     mg -= pst_mg[final_piece_idx, to_sq]
     eg -= pst_eg[final_piece_idx, to_sq]
     phase -= phase_weight[final_piece_idx]
@@ -710,6 +724,8 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     mailbox[to_sq] = -1
     mailbox[from_sq] = original_piece_idx
     h ^= zobrist_piece[original_piece_idx, from_sq]
+    if original_piece_type == PAWN:
+        ph ^= zobrist_piece[original_piece_idx, from_sq]
     mg += pst_mg[original_piece_idx, from_sq]
     eg += pst_eg[original_piece_idx, from_sq]
     phase += phase_weight[original_piece_idx]
@@ -732,6 +748,8 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
         pieces[undo_captured_piece] |= np.uint64(1) << np.uint64(undo_captured_square)
         mailbox[undo_captured_square] = undo_captured_piece
         h ^= zobrist_piece[undo_captured_piece, undo_captured_square]
+        if undo_captured_piece % 6 == PAWN:
+            ph ^= zobrist_piece[undo_captured_piece, undo_captured_square]
         mg += pst_mg[undo_captured_piece, undo_captured_square]
         eg += pst_eg[undo_captured_piece, undo_captured_square]
         phase += phase_weight[undo_captured_piece]
@@ -745,6 +763,7 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     h ^= zobrist_side
 
     zobrist[0] = h
+    zobrist[1] = ph
     eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
 
@@ -958,6 +977,27 @@ def zobrist_hash_from_scratch(pieces, meta, zobrist_piece, zobrist_castling, zob
 def compute_hash(pieces, meta) -> int:
     t = _TABLES
     return int(zobrist_hash_from_scratch(pieces, meta, t.zobrist_piece, t.zobrist_castling, t.zobrist_ep_file, t.zobrist_side))
+
+
+@njit(cache=False)
+def pawn_zobrist_hash_from_scratch(pieces, zobrist_piece):
+    """Same zobrist_piece random values as the main hash, restricted to
+    the two pawn bitboards (idx PAWN=0 white, idx 6+PAWN=6 black) -- see
+    CorrHist's own comment in cb_nb_search.py for why this exists as a
+    hash of its own rather than reusing the main key."""
+    h = np.uint64(0)
+    for idx in (PAWN, 6 + PAWN):
+        bb = pieces[idx]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            h ^= zobrist_piece[idx, square]
+    return h
+
+
+def compute_pawn_hash(pieces) -> int:
+    t = _TABLES
+    return int(pawn_zobrist_hash_from_scratch(pieces, t.zobrist_piece))
 
 
 @njit(cache=False)
@@ -1379,7 +1419,7 @@ def new_eval_state(pieces):
 def run_perft(fen: str, depth: int) -> int:
     pieces, mailbox, meta = fen_to_state(fen)
     moves_buf_stack = np.zeros((depth + 1, MAX_MOVES), dtype=np.int64)
-    zobrist = np.zeros(1, dtype=np.uint64)  # perft doesn't use the hash/eval; just needs to satisfy make_move's signature
+    zobrist = np.zeros(2, dtype=np.uint64)  # perft doesn't use the hash/eval; just needs to satisfy make_move's signature
     eval_state = new_eval_state(pieces)
     t = _TABLES
     return perft(
@@ -1427,7 +1467,7 @@ def generate_legal_moves_simple(pieces, mailbox, meta):
     )
     color = meta[0]
     legal = []
-    zobrist_scratch = np.zeros(1, dtype=np.uint64)
+    zobrist_scratch = np.zeros(2, dtype=np.uint64)
     eval_scratch = new_eval_state(pieces)
     for i in range(count):
         move = int(moves_buf[i])

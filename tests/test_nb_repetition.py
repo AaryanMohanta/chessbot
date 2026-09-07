@@ -34,7 +34,7 @@ def _move(from_sq_name, to_sq_name, promo=f.NO_PROMO, flag=0):
 def _key_after(fen, from_sq_name, to_sq_name):
     """Zobrist key of the position reached from fen by one quiet move."""
     pieces, mailbox, meta = f.fen_to_state(fen)
-    zobrist = np.zeros(1, dtype=np.uint64)
+    zobrist = np.zeros(2, dtype=np.uint64)
     zobrist[0] = np.uint64(f.compute_hash(pieces, meta))
     eval_state = np.zeros(3, dtype=np.int64)
     mg, eg, phase = f.compute_eval_state(pieces)
@@ -49,7 +49,7 @@ def _key_after(fen, from_sq_name, to_sq_name):
 
 def _try_move(fen, from_sq_name, to_sq_name, arrays):
     pieces, mailbox, meta = f.fen_to_state(fen)
-    zobrist = np.zeros(1, dtype=np.uint64)
+    zobrist = np.zeros(2, dtype=np.uint64)
     zobrist[0] = np.uint64(f.compute_hash(pieces, meta))
     mg, eg, phase = f.compute_eval_state(pieces)
     arrays.eval_state[0], arrays.eval_state[1], arrays.eval_state[2] = mg, eg, phase
@@ -75,6 +75,7 @@ def _try_move(fen, from_sq_name, to_sq_name, arrays):
         _T.pst_mg, _T.pst_eg, _T.phase_weight,
         arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
         arrays.killers, arrays.history, arrays.path_keys, arrays.game_history_keys, arrays.game_history_count,
+        arrays.corrhist,
     )
 
 

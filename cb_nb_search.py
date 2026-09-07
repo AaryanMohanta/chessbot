@@ -114,6 +114,64 @@ ENABLE_CONTEMPT = os.environ.get("CB_NB_ENABLE_CONTEMPT", "1") != "0"
 CONTEMPT_SCALE = 0.15
 CONTEMPT_EVAL_CAP = 300
 
+# Correction history (CorrHist, 2026-09): real ladder losses this session
+# showed no tactical blunder in any of them -- a sustained, ~10-30cp/move
+# static-eval bias instead, for 10-15 moves at a stretch, in three of
+# four cases starting from an equal-or-better position and eroding move
+# by move. That shape is exactly what CorrHist targets: it records the
+# gap between static eval and the score search actually found, keyed by
+# a pawn-structure feature (a pawn-only Zobrist hash -- see
+# pawn_zobrist_hash_from_scratch in cb_nb_fast.py and this file's zobrist
+# array, now 2 elements: [0] main key, [1] pawn-only key), and corrects
+# future static evals sharing that same pawn structure. Introduced in
+# Caissa (Oct 2023), now widely adopted; expected to matter more at our
+# own 120+0.5 time control than at fast test-suite TCs, since a real
+# correction needs enough completed searches at meaningful depth to
+# accumulate a signal.
+ENABLE_CORRHIST = os.environ.get("CB_NB_ENABLE_CORRHIST", "0") != "0"
+CORRHIST_SIZE = 16384
+CORRHIST_MASK = CORRHIST_SIZE - 1
+CORRHIST_GRAIN = 256
+CORRHIST_SCALE = 256
+CORRHIST_MAX = 32 * CORRHIST_GRAIN
+
+
+@njit(cache=False)
+def corrhist_update(corrhist, side, pawn_key, depth, search_score, static_eval):
+    """Exponential moving average, weighted more heavily by a deeper
+    search (up to a cap): the whole point is that a deep search's score
+    is trusted more than a shallow one's as evidence of the *true* value
+    of this pawn structure relative to what static eval says it's worth.
+    Callers are responsible for only calling this when the update
+    preconditions hold (not in check; best move quiet or none; the score
+    isn't a bound on the wrong side of static_eval) -- see negamax's own
+    call site for exactly which conditions and why."""
+    idx = int(pawn_key & np.uint64(CORRHIST_MASK))
+    scaled_diff = (search_score - static_eval) * CORRHIST_GRAIN
+    new_weight = min(depth * depth + 2 * depth + 1, 128)
+    entry = corrhist[side, idx]
+    entry = (entry * (CORRHIST_SCALE - new_weight) + scaled_diff * new_weight) // CORRHIST_SCALE
+    entry = max(-CORRHIST_MAX, min(CORRHIST_MAX, entry))
+    corrhist[side, idx] = entry
+
+
+@njit(cache=False)
+def corrhist_correct(corrhist, side, pawn_key, static_eval):
+    """static_eval, nudged by whatever this pawn structure's accumulated
+    correction says -- clamped so it can never reach or cross a mate
+    score (a correction is a static-eval adjustment, never a claim about
+    forced mate, which only a real search result should ever report).
+    Flag-agnostic on purpose -- see this module's ENABLE_CORRHIST for why
+    the check belongs at the call site, not here."""
+    idx = int(pawn_key & np.uint64(CORRHIST_MASK))
+    corrected = static_eval + corrhist[side, idx] // CORRHIST_GRAIN
+    if corrected >= MATE_THRESHOLD:
+        corrected = MATE_THRESHOLD - 1
+    elif corrected <= -MATE_THRESHOLD:
+        corrected = -(MATE_THRESHOLD - 1)
+    return corrected
+
+
 ENABLE_ASPIRATION = os.environ.get("CB_NB_ENABLE_ASPIRATION", "1") != "0"
 
 # Aspiration windows (2026-09, design doc sec.5): from ASPIRATION_MIN_DEPTH
@@ -273,7 +331,7 @@ class SearchArrays:
         self.qmoves_buf_stack = np.zeros((QUIESCENCE_MAX_PLY + 1, MAX_MOVES), dtype=np.int64)
         self.qscores_buf_stack = np.zeros((QUIESCENCE_MAX_PLY + 1, MAX_MOVES), dtype=np.int64)
 
-        self.zobrist = np.zeros(1, dtype=np.uint64)
+        self.zobrist = np.zeros(2, dtype=np.uint64)  # [0]=main key, [1]=pawn-only key (CorrHist)
         self.eval_state = np.zeros(3, dtype=np.int64)
         self.nodes = np.zeros(1, dtype=np.int64)
 
@@ -285,6 +343,13 @@ class SearchArrays:
         # primes the next" benefit actually happen).
         self.killers = np.full((MAX_PLY, 2), -1, dtype=np.int64)
         self.history = np.zeros((12, 64), dtype=np.int64)
+
+        # Correction history (CorrHist, 2026-09) -- [side_to_move,
+        # pawn_key & CORRHIST_MASK]. Persists for the whole game/process
+        # lifetime like the TT, NOT reset per move (see
+        # reset_killers_history) -- the accumulated correction across the
+        # whole game is the point, not a per-move scratch value.
+        self.corrhist = np.zeros((2, CORRHIST_SIZE), dtype=np.int64)
 
         # Repetition detection (2026-09, after a real ladder loss --
         # round 15 -- where the engine gave up a completely won game,
@@ -610,7 +675,7 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
                castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-               pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history):
+               pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist):
     nodes[0] += 1
     if nodes[0] % NODE_CHECK_INTERVAL == 0 and _now() >= hard_deadline:
         raise _SearchTimeout()
@@ -620,6 +685,8 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
         knight_attacks, king_attacks,
     )
+    if ENABLE_CORRHIST:
+        stand_pat = corrhist_correct(corrhist, meta[0], zobrist[1], stand_pat)
     if qply >= QUIESCENCE_MAX_PLY:
         return stand_pat
 
@@ -691,7 +758,7 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
                              castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                              castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                              zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-                             pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history)
+                             pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist)
         F.unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
                       zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                       eval_state, pst_mg, pst_eg, phase_weight)
@@ -769,7 +836,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
              zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
              pst_mg, pst_eg, phase_weight,
              moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-             killers, history, path_keys, game_history_keys, game_history_count):
+             killers, history, path_keys, game_history_keys, game_history_count, corrhist):
     """Kernel split: make_move + legality check + PVS/LMR recursion +
     unmake_move, extracted out of negamax's own body. negamax previously
     had this whole block duplicated at 3 textual call sites (first move,
@@ -822,7 +889,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history, path_keys, game_history_keys, game_history_count)
+                          killers, history, path_keys, game_history_keys, game_history_count, corrhist)
     else:
         score = -negamax(pieces, mailbox, meta, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, generation, True,
                           zobrist, eval_state, nodes, hard_deadline,
@@ -835,7 +902,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history, path_keys, game_history_keys, game_history_count)
+                          killers, history, path_keys, game_history_keys, game_history_count, corrhist)
         if score > alpha:
             score = -negamax(pieces, mailbox, meta, depth - 1, -beta, -alpha, ply + 1, generation, True,
                               zobrist, eval_state, nodes, hard_deadline,
@@ -848,7 +915,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                               zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                               pst_mg, pst_eg, phase_weight,
                               moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                              killers, history, path_keys, game_history_keys, game_history_count)
+                              killers, history, path_keys, game_history_keys, game_history_count, corrhist)
 
     F.unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
                   zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
@@ -868,7 +935,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
             zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
             pst_mg, pst_eg, phase_weight,
             moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-            killers, history, path_keys, game_history_keys, game_history_count):
+            killers, history, path_keys, game_history_keys, game_history_count, corrhist):
     nodes[0] += 1
     if nodes[0] % NODE_CHECK_INTERVAL == 0 and _now() >= hard_deadline:
         raise _SearchTimeout()
@@ -921,7 +988,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                            castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                            castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                            zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-                           pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history)
+                           pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist)
 
     is_pv = (beta - alpha) > 1
 
@@ -949,16 +1016,27 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     # (quiescence's stand_pat, above, still uses its own real window on
     # purpose -- there the lazy bound itself is the thing being compared,
     # not fed into a margin).
+    # static_eval feeds RFP/futility (via corrected_eval, below) exactly
+    # as before CorrHist; CorrHist itself (2026-09) additionally needs it
+    # computed at every not-in-check node regardless of RFP/futility's own
+    # depth cutoffs, both to correct that node's own decisions and to
+    # have something to record an update against at the node's exit --
+    # so the eval call now also fires whenever ENABLE_CORRHIST is on,
+    # not just when can_rfp/can_futility already needed it. When the flag
+    # is off this is unchanged from before: still lazy, still skipped at
+    # PV nodes and deeper non-PV nodes past RFP_MAX_DEPTH/FUTILITY_MAX_DEPTH.
     static_eval = 0
+    corrected_eval = 0
     can_rfp = ENABLE_RFP and not is_pv and not in_chk and depth <= RFP_MAX_DEPTH and abs(beta) < MATE_THRESHOLD
     can_futility = ENABLE_FUTILITY and not is_pv and not in_chk and depth <= FUTILITY_MAX_DEPTH and abs(alpha) < MATE_THRESHOLD
-    if can_rfp or can_futility:
+    if can_rfp or can_futility or (ENABLE_CORRHIST and not in_chk):
         static_eval = F.evaluate_from_state(eval_state, color, pieces, meta[1], -MATE_SCORE, MATE_SCORE,
                                              rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                              bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                                              knight_attacks, king_attacks)
-        if can_rfp and static_eval - RFP_MARGIN_PER_DEPTH * depth >= beta:
-            return static_eval
+        corrected_eval = corrhist_correct(corrhist, color, zobrist[1], static_eval) if ENABLE_CORRHIST else static_eval
+        if can_rfp and corrected_eval - RFP_MARGIN_PER_DEPTH * depth >= beta:
+            return corrected_eval
 
     if (ENABLE_NULL_MOVE and null_allowed and not in_chk and depth >= NULL_MOVE_MIN_DEPTH
             and beta < MATE_THRESHOLD and has_non_pawn_material(pieces, color)):
@@ -974,7 +1052,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                pst_mg, pst_eg, phase_weight,
                                moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                               killers, history, path_keys, game_history_keys, game_history_count)
+                               killers, history, path_keys, game_history_keys, game_history_count, corrhist)
         unmake_null_move(meta, old_ep, zobrist, zobrist_ep_file, zobrist_side)
         if null_score >= beta:
             return null_score
@@ -1016,7 +1094,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
         if is_quiet and not is_first:
             if lmp_limit >= 0 and quiets_tried >= lmp_limit:
                 continue
-            if can_futility and static_eval + FUTILITY_MARGIN[depth] < alpha:
+            if can_futility and corrected_eval + FUTILITY_MARGIN[depth] < alpha:
                 continue
 
         # legal_seen here is a pre-increment count (legal moves found
@@ -1037,7 +1115,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history, path_keys, game_history_keys, game_history_count)
+                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist)
         if not legal:
             continue
         legal_seen += 1
@@ -1064,6 +1142,28 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     if ENABLE_TT:
         tt_store(key, depth, score_to_tt(best, ply), bound, best_move, generation, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
 
+    # CorrHist update (2026-09): only when in check never applies (a
+    # static eval taken while in check isn't meaningful -- the position
+    # is about to change by force); only when the best move found is
+    # quiet or there wasn't one to prefer over "no capture/promo changed
+    # the position" (best_move == -1 can't actually happen here -- an
+    # early return above already covers legal_seen == 0 -- kept as an
+    # explicit check anyway per the design rather than relying on that);
+    # and never against a bound that's already known to disagree with
+    # static_eval in the direction that would matter (a lower bound below
+    # static_eval, or an upper bound above it, tells us nothing about
+    # whether static_eval itself was wrong in this position).
+    if ENABLE_CORRHIST and not in_chk:
+        to_sq = (best_move >> 6) & 0x3F
+        best_is_quiet = best_move == -1 or (
+            mailbox[to_sq] == -1 and ((best_move >> 15) & 0x7) != F.FLAG_EP and ((best_move >> 12) & 0x7) == F.NO_PROMO
+        )
+        if best_is_quiet:
+            bad_lower = bound == BOUND_LOWER and best < static_eval
+            bad_upper = bound == BOUND_UPPER and best > static_eval
+            if not bad_lower and not bad_upper:
+                corrhist_update(corrhist, color, zobrist[1], depth, best, static_eval)
+
     return best
 
 
@@ -1079,7 +1179,7 @@ def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                  pst_mg, pst_eg, phase_weight,
                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                 killers, history, path_keys, game_history_keys, game_history_count):
+                 killers, history, path_keys, game_history_keys, game_history_count, corrhist):
     # Root never null-moves (needs a real move to return) -- LMR isn't
     # applied here either, matching v1: root's window is already
     # (near-)full on move 1 so PVS's own null-window narrowing does most
@@ -1131,7 +1231,7 @@ def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history, path_keys, game_history_keys, game_history_count)
+                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist)
         if not legal:
             continue
         legal_seen += 1
@@ -1205,6 +1305,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
     t = F._TABLES
 
     arrays.zobrist[0] = np.uint64(F.compute_hash(pieces, meta))
+    arrays.zobrist[1] = np.uint64(F.compute_pawn_hash(pieces))
     mg, eg, phase = F.compute_eval_state(pieces)
     arrays.eval_state[0], arrays.eval_state[1], arrays.eval_state[2] = mg, eg, phase
     arrays.nodes[0] = 0
@@ -1246,7 +1347,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
                     t.pst_mg, t.pst_eg, t.phase_weight,
                     arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
                     arrays.killers, arrays.history,
-                    arrays.path_keys, arrays.game_history_keys, arrays.game_history_count,
+                    arrays.path_keys, arrays.game_history_keys, arrays.game_history_count, arrays.corrhist,
                 )
                 if score <= alpha and alpha > -MATE_SCORE - 1:
                     alpha = -MATE_SCORE - 1  # fail-low: widen down, same depth
