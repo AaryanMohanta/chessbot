@@ -44,7 +44,23 @@ MATE_THRESHOLD = MATE_SCORE - 1_000
 # extra plies that might have caught the mistake or found real progress.
 # A few extra plies of search on an already-winning position is cheap
 # insurance against throwing the win away.
-MATE_FOUND_MIN_DEPTH = 4
+#
+# HONEST LIMIT (2026-09): this closes the literal "depth stuck at 1"
+# symptom and, combined with the near_mate_bounds guard on LMP/LMR below
+# (same investigation), is a real improvement -- but replaying the actual
+# round-53 loss move-by-move through a real, continuously-running engine
+# shows the position can still report a mate-range score for many
+# consecutive moves without the mate actually landing, even at this
+# floor and even at 14. The remaining failure mode looks like several
+# genuinely different tries in a simplified King+Queen(+pawns) ending all
+# scoring "mate found" without the search preferring the one that's
+# actually forced and fastest, with no explicit mating-technique
+# heuristic to break the tie -- a deeper fix than is safe to attempt with
+# days left (see the README's own note on this). Tried 4, 8, and 14 here;
+# 8 is kept as a reasonable middle ground -- deep enough to require real
+# verification work, not so deep it taxes the clock on a genuinely
+# early, correct mate.
+MATE_FOUND_MIN_DEPTH = 8
 MAX_PLY = 128
 MAX_MOVES = F.MAX_MOVES
 
@@ -1232,7 +1248,24 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     quiets_tried = 0
     # -1 sentinel: LMP not active at this node (depth*depth+4 is always
     # >= 4, so -1 never collides with a real limit).
-    lmp_limit = _lmp_quiet_limit(depth) if (ENABLE_LMP and not is_pv and not in_chk and depth <= LMP_MAX_DEPTH) else -1
+    #
+    # near_mate_bounds (2026-09, after the round-53 loss investigation):
+    # RFP/futility/null-move all already refuse to fire once alpha/beta
+    # are themselves in mate range (see can_rfp/can_futility/the null-
+    # move condition above) -- LMP and LMR (below) never had the same
+    # guard. Pruning/reducing a quiet move while the search is actively
+    # verifying a suspected mate risks skipping exactly the opponent's
+    # real saving defense, since a "quiet-looking" move is exactly the
+    # kind LMP targets and exactly the kind a mating defense often is
+    # (a king step, not a capture). A wrong "confirmed" mate score from
+    # that gets stored in the TT as an EXACT bound and keeps getting
+    # reused verbatim by every later, similar-looking position for the
+    # rest of the game -- consistent with the real match log showing a
+    # mate-range score every move for 15+ moves in a row without the
+    # mate ever actually landing.
+    near_mate_bounds = abs(alpha) >= MATE_THRESHOLD or abs(beta) >= MATE_THRESHOLD
+    lmp_limit = _lmp_quiet_limit(depth) if (ENABLE_LMP and not is_pv and not in_chk and not near_mate_bounds
+                                             and depth <= LMP_MAX_DEPTH) else -1
 
     for i in range(count):
         move = moves[i]
@@ -1255,7 +1288,8 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
         # *before* this one) -- >= is the correct comparison to match
         # v1's post-increment "legal_seen > LMR_MOVE_THRESHOLD" (off-by-
         # one if left as a plain >, caught before this ever ran).
-        lmr_eligible = legal_seen >= LMR_MOVE_THRESHOLD and depth >= LMR_MIN_DEPTH and is_quiet and not in_chk
+        lmr_eligible = (legal_seen >= LMR_MOVE_THRESHOLD and depth >= LMR_MIN_DEPTH and is_quiet
+                        and not in_chk and not near_mate_bounds)
 
         legal, score = try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, is_first, lmr_eligible,
                                  color, opponent,

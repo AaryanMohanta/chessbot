@@ -142,6 +142,28 @@ pytest -m slow tests/test_perft.py
   on a rework with no time left to properly SPRT/ladder-test it back in
   if it goes wrong. Parked here for whenever there's runway to do it
   properly.
+- **A completely won King+Queen(+pawns) vs King(+pawns) endgame can still
+  draw by repetition (2026-09, real ladder loss, round 53).** Root cause:
+  once the search believes it has found a forced mate, several DIFFERENT
+  continuations in a simplified ending like this can each independently
+  score as "mate found" without any of them being the one the search
+  actually commits to and delivers -- there's no explicit mating-
+  technique heuristic (e.g. king-box-in scoring) to break the tie in
+  favour of real, converging progress. Two real, tested mitigations
+  shipped (see `MATE_FOUND_MIN_DEPTH` and the `near_mate_bounds` guard on
+  LMP/LMR in `cb_nb_search.py`): a shallow, possibly-stale mate score no
+  longer stops the iterative-deepening loop early, and late-move pruning/
+  reduction no longer undermine the search while it's actively verifying
+  a suspected mate. Replaying the actual round-53 loss move-by-move
+  through a real, continuously-running engine (real opponent moves, real
+  clock values) confirms these help -- depth is no longer stuck at 1 --
+  but does NOT confirm they fully eliminate the failure mode; the
+  position can still show a stable mate-range score for many consecutive
+  moves without the mate landing. A full fix (real mating-technique
+  scoring, or treating a K+Q(+P) vs K(+P) reduction as a Syzygy-adjacent
+  special case) is a bigger change than is safe to attempt with days left
+  and no time to properly SPRT/ladder-test it back in. Known, partially
+  mitigated, not eliminated.
 
 ## Running the harness
 
