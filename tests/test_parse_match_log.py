@@ -65,6 +65,38 @@ def test_parse_build_tag_returns_none_when_absent():
     assert parse_build_tag("no build tag line here\nmv ply=0 layer=book d=- sc=- n=- t=0.00s left=120.0s") is None
 
 
+_REAL_DASHBOARD_LOG = """\
+AI CHESSATHON MATCH LOG
+=======================
+
+MATCH
+  Round          Rated 49
+
+OUTPUT
+  3,785 bytes on stderr
+
+  [agent] build_tag=712f2aa
+  [cb_engine] init took 1.5 ms (budget 90000 ms)
+  [cb_nb_engine] init returned after 56723.1 ms (fully warm) ready_before_move1=True stages: stage_movegen=5423ms
+  mv ply=16 layer=numba d=10 sc=-86 n=593794 t=2.15s left=120.0s
+  mv ply=18 layer=numba d=9 sc=-136 n=241604 t=0.87s left=118.3s
+"""
+
+
+def test_parse_moves_matches_the_real_indented_dashboard_format():
+    """The downloaded dashboard .log file re-indents the captured stderr
+    by two spaces under its OUTPUT section (see this module's docstring)
+    -- a real bug caught 2026-09 when every real downloaded log parsed to
+    zero moves despite the synthetic (unindented) fixture above working
+    fine. Locks in the ^\\s* anchor fix."""
+    moves = parse_moves(_REAL_DASHBOARD_LOG)
+    assert len(moves) == 2
+    assert moves[0].ply == 16 and moves[0].score == -86.0
+    assert parse_build_tag(_REAL_DASHBOARD_LOG) == "712f2aa"
+    init = parse_init(_REAL_DASHBOARD_LOG)
+    assert init is not None and init.ready_before_move1 is True
+
+
 def test_gracefully_handles_a_pre_instrumentation_log():
     old_log = "[cb_engine] init took 1.3 ms (budget 90000 ms)\nOUTPUT\n  153 bytes on stderr\n"
     moves = parse_moves(old_log)

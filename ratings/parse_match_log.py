@@ -1,4 +1,4 @@
-"""Parses one real AI Chessathon match .log file's OUTPUT/stderr section
+r"""Parses one real AI Chessathon match .log file's OUTPUT/stderr section
 into structured per-move telemetry (see agent.py's _log_move and
 cb_nb_engine.py's init logging for the line formats being parsed).
 
@@ -8,6 +8,15 @@ the new 8KB-per-game cap (first 4KB + last 4KB, PGN shown separately on
 the dashboard) means a long game's middle third of moves is simply
 missing from what we get back, and the parser has to produce a sane
 partial result from that rather than choke on it.
+
+Every pattern below allows leading whitespace before its anchor (`^\s*`,
+not bare `^`): the raw stderr agent.py writes has none, but the actual
+downloaded dashboard .log file (MATCH/INIT/CLOCK/RESULT/MOVES sections,
+then an "OUTPUT" section) re-indents that captured stderr by two spaces
+for readability. A bare `^` anchor matches synthetic unindented fixtures
+fine but silently matches nothing at all against every real downloaded
+log -- caught 2026-09 when ingesting real round files returned zero
+telemetry across the board.
 
 Usage: python ratings/parse_match_log.py <log_file_or_dir> [...]
 Prints one summary per file; see report_from_moves() for the fields.
@@ -20,20 +29,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _MOVE_RE = re.compile(
-    r"^mv ply=(?P<ply>\d+) layer=(?P<layer>\S+) d=(?P<depth>\S+) sc=(?P<score>\S+) "
+    r"^\s*mv ply=(?P<ply>\d+) layer=(?P<layer>\S+) d=(?P<depth>\S+) sc=(?P<score>\S+) "
     r"n=(?P<nodes>\S+) t=(?P<t>[\d.]+)s left=(?P<left>[\d.]+)s",
     re.MULTILINE,
 )
 _INIT_RE = re.compile(
-    r"^\[cb_nb_engine\] init returned after (?P<ms>[\d.]+) ms \((?P<status>[^)]*)\) "
+    r"^\s*\[cb_nb_engine\] init returned after (?P<ms>[\d.]+) ms \((?P<status>[^)]*)\) "
     r"ready_before_move1=(?P<ready>True|False)(?: stages: (?P<stages>.*))?$",
     re.MULTILINE,
 )
 _BG_WARMUP_RE = re.compile(
-    r"^\[cb_nb_engine\] background warmup finished after (?P<ms>[\d.]+) ms \(numba_failed=(?P<failed>True|False)\)$",
+    r"^\s*\[cb_nb_engine\] background warmup finished after (?P<ms>[\d.]+) ms \(numba_failed=(?P<failed>True|False)\)$",
     re.MULTILINE,
 )
-_BUILD_TAG_RE = re.compile(r"^\[agent\] build_tag=(?P<tag>\S+)$", re.MULTILINE)
+_BUILD_TAG_RE = re.compile(r"^\s*\[agent\] build_tag=(?P<tag>\S+)$", re.MULTILINE)
 
 
 @dataclass
