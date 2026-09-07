@@ -65,11 +65,21 @@ def _plan_games(games_per_pairing: int) -> list[tuple[str, str, str, str]]:
 
 
 def _play_one(white_name, black_name, opening_id, fen, time_ms, increment_ms):
-    result = play_game(
-        AGENT_PATH, AGENT_PATH,
-        time_ms=time_ms, increment_ms=increment_ms, start_fen=fen,
-        white_env=VARIANTS[white_name], black_env=VARIANTS[black_name],
-    )
+    """Returns (white_name, black_name, opening_id, result_or_none) --
+    None means a harness-level crash (e.g. numba/LLVM erroring or one
+    side never sending a ready signal under heavy concurrent compile
+    load -- see ratings/sprt.py's own _play_pair for the same transient
+    failure, there too caught and excluded rather than allowed to take
+    down an entire run over one bad pairing)."""
+    try:
+        result = play_game(
+            AGENT_PATH, AGENT_PATH,
+            time_ms=time_ms, increment_ms=increment_ms, start_fen=fen,
+            white_env=VARIANTS[white_name], black_env=VARIANTS[black_name],
+        )
+    except Exception as exc:
+        print(f"  WARNING: {white_name} vs {black_name} ({opening_id}) crashed, excluding: {exc!r}", flush=True)
+        return white_name, black_name, opening_id, None
     return white_name, black_name, opening_id, result
 
 
@@ -98,9 +108,10 @@ def main() -> int:
         for future in as_completed(futures):
             white_name, black_name, opening_id, result = future.result()
             done += 1
-            if result.reason in HARNESS_ARTIFACT_REASONS:
+            if result is None or result.reason in HARNESS_ARTIFACT_REASONS:
                 errors += 1
-                print(f"  [{done}/{len(plan)}] ERROR {white_name} vs {black_name}: {result.reason} (excluded)", flush=True)
+                reason = "harness crash" if result is None else result.reason
+                print(f"  [{done}/{len(plan)}] ERROR {white_name} vs {black_name}: {reason} (excluded)", flush=True)
                 continue
 
             white_score = {"white": 1.0, "black": 0.0, None: 0.5}[result.winner]
