@@ -75,7 +75,7 @@ def _try_move(fen, from_sq_name, to_sq_name, arrays):
         _T.pst_mg, _T.pst_eg, _T.phase_weight,
         arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
         arrays.killers, arrays.history, arrays.path_keys, arrays.game_history_keys, arrays.game_history_count,
-        arrays.corrhist,
+        arrays.corrhist, arrays.cont_piece, arrays.cont_to, arrays.cont_hist_1ply, arrays.cont_hist_2ply,
     )
 
 

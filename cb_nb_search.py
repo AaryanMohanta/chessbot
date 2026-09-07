@@ -39,6 +39,26 @@ MAX_MOVES = F.MAX_MOVES
 # contribution by toggling one at a time (module-level constants get
 # folded in at njit compile time, so toggling forces a real recompile).
 ENABLE_KILLERS_HISTORY = os.environ.get("CB_NB_ENABLE_KILLERS_HISTORY", "1") != "0"
+# Continuation history (ContHist, 2026-09): item 2 of the 3-change plan,
+# right after CorrHist. Killers/history alone only ever ask "has this
+# quiet move worked well historically, anywhere" -- ContHist asks "has
+# this quiet move worked well specifically as a REPLY to what the
+# opponent just played (1 ply back) and to what we ourselves played two
+# plies ago (2 plies back, the move that set up the tactical theme this
+# node continues)". Move ordering quality in quiet positions is exactly
+# what decides whether LMR/pruning (both downstream of ordering) end up
+# skipping the moves that actually hold a small advantage or defend a
+# small disadvantage -- see the real-loss diagnosis that motivated
+# CorrHist above, which this targets from the other side (search
+# selectivity, not eval bias).
+#
+# Indexing is the actual risk here, not the update math (same
+# +=depth*depth formula as the existing history table) -- a widely-
+# circulated real implementation has a copy-paste bug reading (ss-1)
+# for BOTH the 1-ply and 2-ply lookup. See _cont_hist_context and
+# tests/test_conthist.py, which exists specifically to catch that class
+# of bug rather than trust the indexing because it compiles.
+ENABLE_CONTHIST = os.environ.get("CB_NB_ENABLE_CONTHIST", "0") != "0"
 ENABLE_NULL_MOVE = os.environ.get("CB_NB_ENABLE_NULL_MOVE", "1") != "0"
 ENABLE_LMR = os.environ.get("CB_NB_ENABLE_LMR", "1") != "0"
 # SEE-based quiescence pruning (2026-09): skip a capture in quiescence
@@ -351,6 +371,18 @@ class SearchArrays:
         # whole game is the point, not a per-move scratch value.
         self.corrhist = np.zeros((2, CORRHIST_SIZE), dtype=np.int64)
 
+        # Continuation history (ContHist, 2026-09) -- cont_piece[p]/
+        # cont_to[p] record the (piece, to-square) of the move that was
+        # played to REACH ply p (written by try_move for the child it's
+        # about to recurse into); cont_hist_1ply/2ply are indexed
+        # [prev_piece, prev_to, piece, to]. Same per-move reset lifecycle
+        # as killers/history below (see reset_killers_history) -- unlike
+        # CorrHist/the TT, this is deliberately NOT carried across moves.
+        self.cont_piece = np.full(MAX_PLY + 2, -1, dtype=np.int64)
+        self.cont_to = np.full(MAX_PLY + 2, -1, dtype=np.int64)
+        self.cont_hist_1ply = np.zeros((12, 64, 12, 64), dtype=np.int64)
+        self.cont_hist_2ply = np.zeros((12, 64, 12, 64), dtype=np.int64)
+
         # Repetition detection (2026-09, after a real ladder loss --
         # round 15 -- where the engine gave up a completely won game,
         # up a full queen, by walking a checking sequence into a
@@ -388,6 +420,10 @@ class SearchArrays:
     def reset_killers_history(self):
         self.killers.fill(-1)
         self.history.fill(0)
+        self.cont_piece.fill(-1)
+        self.cont_to.fill(-1)
+        self.cont_hist_1ply.fill(0)
+        self.cont_hist_2ply.fill(0)
 
 
 @njit(cache=False)
@@ -612,18 +648,21 @@ def see_capture(move, side_to_move, pieces, mailbox,
 
 @njit(cache=False)
 def order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                 cont_hist_1ply, cont_hist_2ply, prev1_piece, prev1_to, prev2_piece, prev2_to,
                  rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                  bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                  knight_attacks, king_attacks, pawn_attacks):
     """Fills scores_buf[:count] and insertion-sorts moves[:count]
     descending by score: TT move highest, then winning-or-equal captures
     and promotions by SEE value, then the two killers, then quiets by
-    history score, then losing captures by SEE value -- see
-    WINNING_CAPTURE_BASE/LOSING_CAPTURE_BASE above for why captures split
-    around the killer band instead of all sitting above it. Quiescence
-    calls this too (with killer0=killer1=-1, real history array) -- the
-    killer/history branch is simply dead there since a captures-only
-    move list never reaches it, cheaper than a second code path."""
+    history score (2026-09: history + ContHist's 1-ply context + half its
+    2-ply context, see ENABLE_CONTHIST), then losing captures by SEE
+    value -- see WINNING_CAPTURE_BASE/LOSING_CAPTURE_BASE above for why
+    captures split around the killer band instead of all sitting above
+    it. Quiescence calls this too (with killer0=killer1=-1, prev1/prev2
+    piece/to = -1, real table references) -- the killer/history/ContHist
+    branch is simply dead there since a captures-only move list never
+    reaches it, cheaper than a second code path."""
     for i in range(count):
         move = moves[i]
         if move == tt_move:
@@ -651,7 +690,16 @@ def order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, kil
             scores_buf[i] = KILLER_BASE_SCORE
         elif ENABLE_KILLERS_HISTORY:
             attacker_idx = mailbox[from_sq]
-            scores_buf[i] = history[attacker_idx, to_sq] if attacker_idx != -1 else 0
+            if attacker_idx == -1:
+                scores_buf[i] = 0
+            else:
+                quiet_score = history[attacker_idx, to_sq]
+                if ENABLE_CONTHIST:
+                    if prev1_piece != -1:
+                        quiet_score += cont_hist_1ply[prev1_piece, prev1_to, attacker_idx, to_sq]
+                    if prev2_piece != -1:
+                        quiet_score += cont_hist_2ply[prev2_piece, prev2_to, attacker_idx, to_sq] // 2
+                scores_buf[i] = quiet_score
         else:
             scores_buf[i] = 0
 
@@ -675,7 +723,8 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
                castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-               pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist):
+               pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist,
+               cont_hist_1ply, cont_hist_2ply):
     nodes[0] += 1
     if nodes[0] % NODE_CHECK_INTERVAL == 0 and _now() >= hard_deadline:
         raise _SearchTimeout()
@@ -721,6 +770,7 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
             cap_count += 1
 
     order_moves(pieces, mailbox, captures_buf, cap_count, scores_buf, -1, -1, -1, history,
+                cont_hist_1ply, cont_hist_2ply, -1, -1, -1, -1,
                 rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                 knight_attacks, king_attacks, pawn_attacks)
@@ -758,7 +808,7 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
                              castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                              castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                              zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-                             pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist)
+                             pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist, cont_hist_1ply, cont_hist_2ply)
         F.unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
                       zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                       eval_state, pst_mg, pst_eg, phase_weight)
@@ -805,9 +855,51 @@ def unmake_null_move(meta, old_ep, zobrist, zobrist_ep_file, zobrist_side):
 
 
 @njit(cache=False)
-def record_cutoff(pieces, mailbox, move, depth, ply, killers, history):
+def _cont_hist_context(cont_piece, cont_to, ply):
+    """(prev1_piece, prev1_to, prev2_piece, prev2_to) for ContHist
+    lookups at the node currently at ``ply``. cont_piece[p]/cont_to[p]
+    holds the (piece, to-square) of the move that was played TO REACH
+    ply p -- written by the parent node right before recursing (see
+    try_move). So at this node: 1-ply-back ("what did the opponent just
+    play") is cont_piece[ply] itself; 2-ply-back ("what did WE play last
+    time it was our move") is cont_piece[ply - 1], one slot further back
+    up the same stack -- NOT cont_piece[ply] again (that's the specific
+    copy-paste bug this function's own tests exist to catch). -1
+    sentinels when that much history doesn't exist yet (near the root)."""
+    if ply >= 1:
+        prev1_piece, prev1_to = cont_piece[ply], cont_to[ply]
+    else:
+        prev1_piece, prev1_to = -1, -1
+    if ply >= 2:
+        prev2_piece, prev2_to = cont_piece[ply - 1], cont_to[ply - 1]
+    else:
+        prev2_piece, prev2_to = -1, -1
+    return prev1_piece, prev1_to, prev2_piece, prev2_to
+
+
+@njit(cache=False)
+def record_cutoff_conthist(cont_hist_1ply, cont_hist_2ply, piece, to_sq,
+                            prev1_piece, prev1_to, prev2_piece, prev2_to, depth):
+    """The ContHist half of record_cutoff's job, isolated so its indexing
+    can be tested directly against a hand-built context (see
+    tests/test_conthist.py) rather than only through a full search.
+    Each offset updates independently and is skipped outright when its
+    own context doesn't exist yet -- a missing 2-ply context must never
+    fall back to reusing the 1-ply one."""
+    if prev1_piece != -1:
+        cont_hist_1ply[prev1_piece, prev1_to, piece, to_sq] += depth * depth
+    if prev2_piece != -1:
+        cont_hist_2ply[prev2_piece, prev2_to, piece, to_sq] += depth * depth
+
+
+@njit(cache=False)
+def record_cutoff(pieces, mailbox, move, depth, ply, killers, history,
+                   cont_hist_1ply, cont_hist_2ply, prev1_piece, prev1_to, prev2_piece, prev2_to):
     """A quiet move caused a beta cutoff: remember it as a killer at this
-    ply and bump its history score. Matches v1's cb_search.py exactly."""
+    ply, bump its history score, and (2026-09) its continuation-history
+    score against the 1-ply and 2-ply context this node was reached
+    through. Matches v1's cb_search.py exactly for the killers/history
+    part."""
     if not ENABLE_KILLERS_HISTORY:
         return
     to_sq = (move >> 6) & 0x3F
@@ -821,6 +913,9 @@ def record_cutoff(pieces, mailbox, move, depth, ply, killers, history):
     attacker_idx = mailbox[from_sq]
     if attacker_idx != -1:
         history[attacker_idx, to_sq] += depth * depth
+        if ENABLE_CONTHIST:
+            record_cutoff_conthist(cont_hist_1ply, cont_hist_2ply, attacker_idx, to_sq,
+                                    prev1_piece, prev1_to, prev2_piece, prev2_to, depth)
 
 
 @njit(cache=False)
@@ -836,7 +931,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
              zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
              pst_mg, pst_eg, phase_weight,
              moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-             killers, history, path_keys, game_history_keys, game_history_count, corrhist):
+             killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply):
     """Kernel split: make_move + legality check + PVS/LMR recursion +
     unmake_move, extracted out of negamax's own body. negamax previously
     had this whole block duplicated at 3 textual call sites (first move,
@@ -866,6 +961,20 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                       eval_state, pst_mg, pst_eg, phase_weight)
         return False, 0
 
+    if ENABLE_CONTHIST:
+        # Recorded for the CHILD node (ply + 1) we're about to enter --
+        # "the move that led here", read back via _cont_hist_context at
+        # that node's own ply. mailbox[to_sq] is read AFTER make_move on
+        # purpose: it's the piece as it now stands (the promoted piece,
+        # for a promotion), not the pawn that used to be at from_sq --
+        # moot for what actually reads this (only quiet moves ever
+        # consult ContHist, and a quiet move can't be a promotion), but
+        # this is the natural value to reach for at this point in the
+        # function regardless.
+        to_sq_for_context = (move >> 6) & 0x3F
+        cont_piece[ply + 1] = mailbox[to_sq_for_context]
+        cont_to[ply + 1] = to_sq_for_context
+
     reduction = 0
     if ENABLE_LMR and lmr_eligible:
         gives_check = F.is_square_attacked(pieces, F.king_square(pieces, opponent_color), mover_color,
@@ -889,7 +998,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                          killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
     else:
         score = -negamax(pieces, mailbox, meta, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, generation, True,
                           zobrist, eval_state, nodes, hard_deadline,
@@ -902,7 +1011,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                           zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                           pst_mg, pst_eg, phase_weight,
                           moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                          killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                          killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
         if score > alpha:
             score = -negamax(pieces, mailbox, meta, depth - 1, -beta, -alpha, ply + 1, generation, True,
                               zobrist, eval_state, nodes, hard_deadline,
@@ -915,7 +1024,7 @@ def try_move(pieces, mailbox, meta, move, depth, alpha, beta, ply, generation, i
                               zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                               pst_mg, pst_eg, phase_weight,
                               moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                              killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                              killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
 
     F.unmake_move(pieces, mailbox, meta, move, undo[0], undo[1], undo[2], undo[3], undo[4], castle_rook_from, castle_rook_to,
                   zobrist, zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
@@ -935,7 +1044,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
             zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
             pst_mg, pst_eg, phase_weight,
             moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-            killers, history, path_keys, game_history_keys, game_history_count, corrhist):
+            killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply):
     nodes[0] += 1
     if nodes[0] % NODE_CHECK_INTERVAL == 0 and _now() >= hard_deadline:
         raise _SearchTimeout()
@@ -980,6 +1089,8 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     if in_chk:
         depth += 1  # check extension, unconditional -- same as v1's cb_search.py
 
+    prev1_piece, prev1_to, prev2_piece, prev2_to = _cont_hist_context(cont_piece, cont_to, ply)
+
     if depth <= 0:
         return quiescence(pieces, mailbox, meta, alpha, beta, 0, zobrist, eval_state, nodes, hard_deadline,
                            rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
@@ -988,7 +1099,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                            castle_king_to, castle_rook_from, castle_rook_to, castle_right_bit,
                            castle_empty_squares, castle_king_path, castle_all_rook_squares, castle_all_rook_bits,
                            zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
-                           pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist)
+                           pst_mg, pst_eg, phase_weight, qmoves_buf_stack, qscores_buf_stack, history, corrhist, cont_hist_1ply, cont_hist_2ply)
 
     is_pv = (beta - alpha) > 1
 
@@ -1052,7 +1163,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                pst_mg, pst_eg, phase_weight,
                                moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                               killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                               killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
         unmake_null_move(meta, old_ep, zobrist, zobrist_ep_file, zobrist_side)
         if null_score >= beta:
             return null_score
@@ -1068,6 +1179,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
     killer0 = killers[ply, 0] if ply < MAX_PLY else -1
     killer1 = killers[ply, 1] if ply < MAX_PLY else -1
     order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                cont_hist_1ply, cont_hist_2ply, prev1_piece, prev1_to, prev2_piece, prev2_to,
                 rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                 knight_attacks, king_attacks, pawn_attacks)
@@ -1115,7 +1227,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
         if not legal:
             continue
         legal_seen += 1
@@ -1128,7 +1240,8 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
         if best > alpha:
             alpha = best
         if alpha >= beta:
-            record_cutoff(pieces, mailbox, move, depth, ply, killers, history)
+            record_cutoff(pieces, mailbox, move, depth, ply, killers, history,
+                           cont_hist_1ply, cont_hist_2ply, prev1_piece, prev1_to, prev2_piece, prev2_to)
             break
 
     if legal_seen == 0:
@@ -1179,7 +1292,7 @@ def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                  pst_mg, pst_eg, phase_weight,
                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                 killers, history, path_keys, game_history_keys, game_history_count, corrhist):
+                 killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply):
     # Root never null-moves (needs a real move to return) -- LMR isn't
     # applied here either, matching v1: root's window is already
     # (near-)full on move 1 so PVS's own null-window narrowing does most
@@ -1203,7 +1316,12 @@ def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                                            castle_empty_squares, castle_king_path)
     killer0 = killers[0, 0]
     killer1 = killers[0, 1]
+    # Root has no ContHist context of its own (ply 0 -- no move has been
+    # made yet in this search line), so it always passes the -1 "no
+    # context" sentinels; only cont_hist_1ply/2ply are real, threaded
+    # through to try_move below so ply 1's own context gets recorded.
     order_moves(pieces, mailbox, moves, count, scores_buf, tt_move, killer0, killer1, history,
+                cont_hist_1ply, cont_hist_2ply, -1, -1, -1, -1,
                 rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                 knight_attacks, king_attacks, pawn_attacks)
@@ -1231,7 +1349,7 @@ def root_search(pieces, mailbox, meta, depth, generation, alpha, beta,
                                  zobrist_piece, zobrist_castling, zobrist_ep_file, zobrist_side,
                                  pst_mg, pst_eg, phase_weight,
                                  moves_buf_stack, scores_buf_stack, qmoves_buf_stack, qscores_buf_stack,
-                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist)
+                                 killers, history, path_keys, game_history_keys, game_history_count, corrhist, cont_piece, cont_to, cont_hist_1ply, cont_hist_2ply)
         if not legal:
             continue
         legal_seen += 1
@@ -1348,6 +1466,7 @@ def search(fen: str, soft_ms: float, hard_ms: float, arrays: "SearchArrays", gen
                     arrays.moves_buf_stack, arrays.scores_buf_stack, arrays.qmoves_buf_stack, arrays.qscores_buf_stack,
                     arrays.killers, arrays.history,
                     arrays.path_keys, arrays.game_history_keys, arrays.game_history_count, arrays.corrhist,
+                    arrays.cont_piece, arrays.cont_to, arrays.cont_hist_1ply, arrays.cont_hist_2ply,
                 )
                 if score <= alpha and alpha > -MATE_SCORE - 1:
                     alpha = -MATE_SCORE - 1  # fail-low: widen down, same depth
