@@ -172,7 +172,7 @@ def _contempt_for_fen(fen):
         pieces, mailbox, meta, eval_state,
         _T.rook_masks, _T.rook_magics, _T.rook_shifts, _T.rook_offsets, _T.rook_table,
         _T.bishop_masks, _T.bishop_magics, _T.bishop_shifts, _T.bishop_offsets, _T.bishop_table,
-        _T.knight_attacks, _T.king_attacks,
+        _T.knight_attacks, _T.king_attacks, _T.pawn_attacks,
     )
 
 

@@ -126,6 +126,22 @@ pytest -m slow tests/test_perft.py
   clock is reserved for final validation runs and the wire-protocol smoke
   test — nobody SPRTs at their competition TC, it's needlessly slow for
   no statistical benefit.
+- **King safety's tuner-fit weights came back negative (2026-09), which
+  is a misspecification signal, not just tuning noise.** King safety is
+  genuinely quadratic in attacker count (two attackers on the king zone
+  is much more than twice as dangerous as one), but the current term is
+  linear (`attacker_weight * KING_ATTACKER_PENALTY_PER_UNIT_MG`, see
+  `_king_safety_score` in `cb_nb_fast.py`), and `quiet-labeled.epd`
+  underrepresents the sharp, king-hunt-heavy positions where that
+  linearity actually breaks. The right fix is a non-linear response
+  curve (a real quadratic or a lookup table indexed by attacker count,
+  the way Stockfish's own king-safety term works) plus retuning against
+  data that better covers those positions. Diagnosed but deliberately
+  **not** rebuilt with under a week left before the deadline — a shipping
+  eval term already validated against real losses is not worth risking
+  on a rework with no time left to properly SPRT/ladder-test it back in
+  if it goes wrong. Parked here for whenever there's runway to do it
+  properly.
 
 ## Running the harness
 

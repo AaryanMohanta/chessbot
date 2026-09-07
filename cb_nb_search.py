@@ -192,6 +192,22 @@ def corrhist_correct(corrhist, side, pawn_key, static_eval):
     return corrected
 
 
+# Internal iterative reduction (IIR, 2026-09): item 3 of the 3-change
+# plan, alongside tempo/threats -- a search-side technique rather than
+# an eval term, but shipped in the same batch. See its call site in
+# negamax for the reasoning.
+ENABLE_IIR = os.environ.get("CB_NB_ENABLE_IIR", "0") != "0"
+IIR_MIN_DEPTH = 4
+
+
+@njit(cache=False)
+def _should_apply_iir(tt_move, depth):
+    """Flag-agnostic on purpose (see ENABLE_CORRHIST's own comment on the
+    same pattern) -- ENABLE_IIR is checked at the call site, not baked in
+    here, so this stays directly testable regardless of which way the
+    flag compiled."""
+    return tt_move == -1 and depth >= IIR_MIN_DEPTH
+
 ENABLE_ASPIRATION = os.environ.get("CB_NB_ENABLE_ASPIRATION", "1") != "0"
 
 # Aspiration windows (2026-09, design doc sec.5): from ASPIRATION_MIN_DEPTH
@@ -451,7 +467,7 @@ def _is_repetition(key, ply, path_keys, game_history_keys, game_history_count):
 def _contempt_draw_score(pieces, mailbox, meta, eval_state,
                           rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                           bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-                          knight_attacks, king_attacks):
+                          knight_attacks, king_attacks, pawn_attacks):
     """The draw score for a detected repetition, adjusted by contempt --
     see ENABLE_CONTEMPT's comment above. Returns 0 outright when contempt
     is disabled, matching the pre-2026-09 behavior exactly. mailbox is
@@ -464,7 +480,7 @@ def _contempt_draw_score(pieces, mailbox, meta, eval_state,
         eval_state, color, pieces, meta[1], -1_000_000, 1_000_000,
         rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-        knight_attacks, king_attacks,
+        knight_attacks, king_attacks, pawn_attacks,
     )
     capped = min(max(static_eval, -CONTEMPT_EVAL_CAP), CONTEMPT_EVAL_CAP)
     return np.int64(-CONTEMPT_SCALE * capped)
@@ -732,7 +748,7 @@ def quiescence(pieces, mailbox, meta, alpha, beta, qply, zobrist, eval_state, no
         eval_state, meta[0], pieces, meta[1], alpha, beta,
         rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-        knight_attacks, king_attacks,
+        knight_attacks, king_attacks, pawn_attacks,
     )
     if ENABLE_CORRHIST:
         stand_pat = corrhist_correct(corrhist, meta[0], zobrist[1], stand_pat)
@@ -1062,7 +1078,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
             pieces, mailbox, meta, eval_state,
             rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
             bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-            knight_attacks, king_attacks,
+            knight_attacks, king_attacks, pawn_attacks,
         )
     path_keys[ply] = key
     found, tt_depth, tt_score_raw, tt_bound, tt_move = tt_probe(key, tt_keys, tt_depths, tt_scores, tt_bounds, tt_moves, tt_generations)
@@ -1079,6 +1095,17 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
             beta = min(beta, tt_score)
         if alpha >= beta:
             return tt_score
+
+    # Internal iterative reduction (IIR, 2026-09, item 3 of the 3-change
+    # plan): no TT move means no good first guess for move ordering at
+    # this node -- searching it at full depth right now is more likely to
+    # waste nodes on a badly-ordered move list than to find something
+    # worth keeping at that depth. Reducing by one ply here is cheaper,
+    # and (via the TT store below) leaves a move behind that orders the
+    # NEXT visit to this node -- typically a re-search from an outer
+    # iteration -- properly.
+    if ENABLE_IIR and _should_apply_iir(tt_move, depth):
+        depth -= 1
 
     color = meta[0]
     opponent = 1 - color
@@ -1144,7 +1171,7 @@ def negamax(pieces, mailbox, meta, depth, alpha, beta, ply, generation, null_all
         static_eval = F.evaluate_from_state(eval_state, color, pieces, meta[1], -MATE_SCORE, MATE_SCORE,
                                              rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                              bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-                                             knight_attacks, king_attacks)
+                                             knight_attacks, king_attacks, pawn_attacks)
         corrected_eval = corrhist_correct(corrhist, color, zobrist[1], static_eval) if ENABLE_CORRHIST else static_eval
         if can_rfp and corrected_eval - RFP_MARGIN_PER_DEPTH * depth >= beta:
             return corrected_eval

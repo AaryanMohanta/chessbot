@@ -51,6 +51,15 @@ _TEXEL_TUNED_PST = os.environ.get("CB_NB_TEXEL_TUNED_PST", "1") != "0"
 # against the material+PST-only baseline.
 ENABLE_EXTENDED_EVAL = os.environ.get("CB_NB_ENABLE_EXTENDED_EVAL", "1") != "0"
 
+# Item 3 of the 2026-09 3-change plan (cheap eval additions, one batch),
+# gated separately from ENABLE_EXTENDED_EVAL above -- that flag already
+# has a validated ON default from its own retest; a brand new, untested
+# batch shouldn't ride under the same flag, or reverting the new batch
+# alone would mean reverting six already-proven terms with it.
+ENABLE_TEMPO = os.environ.get("CB_NB_ENABLE_TEMPO", "0") != "0"
+ENABLE_THREATS = os.environ.get("CB_NB_ENABLE_THREATS", "0") != "0"
+TEMPO_BONUS = 15  # centipawns, side to move -- flat, not tapered by phase
+
 WHITE, BLACK = 0, 1
 PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = 0, 1, 2, 3, 4, 5
 NO_PROMO = 6
@@ -1352,11 +1361,113 @@ def _passed_pawn_score(pieces):
     return mg, eg
 
 
+THREAT_PAWN_ATTACK_BONUS_MG = 20  # per enemy N/B/R/Q one of our pawns attacks
+THREAT_HANGING_TO_PAWN_PENALTY_MG = 40  # our N/B/R/Q, undefended, attacked by an enemy pawn
+THREAT_HANGING_TO_MINOR_PENALTY_MG = 30  # our R/Q, undefended, attacked by an enemy N/B
+THREAT_HANGING_TO_ROOK_PENALTY_MG = 25  # our Q, undefended, attacked by an enemy R
+
+
+@njit(cache=False)
+def _threats_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                    bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                    knight_attacks, king_attacks, pawn_attacks):
+    """White-minus-black (mg-only) threat bonus/penalty (2026-09) --
+    Stockfish's largest non-material eval group, previously entirely
+    absent here. Two cheap, unambiguous cases rather than a full
+    SEE-per-piece sweep:
+
+      1. A bonus for each enemy minor/major piece one of our pawns
+         attacks -- a pawn is the cheapest attacker there is, so this is
+         a genuine threat regardless of what defends the target.
+      2. A penalty for each of our OWN minor/major pieces that is BOTH
+         undefended (not is_square_attacked by our own side) AND
+         attacked by a strictly cheaper enemy piece: a pawn attacking
+         anything; a knight or bishop attacking a rook or queen; a rook
+         attacking a queen. Two pieces of the same conventional value
+         (e.g. a knight attacked by a bishop) do NOT count -- neither is
+         "cheaper" than the other.
+
+    A piece hanging to a cheaper attacker is a near-forced material loss
+    the search may not see if it's outside the line currently being
+    read -- exactly the kind of static signal a cheap eval term exists
+    to catch, independent of anything mobility/king-safety above already
+    cover."""
+    mg = 0
+    occ = occupied_all(pieces)
+    for color in (0, 1):
+        enemy = 1 - color
+        own_base = color * 6
+        enemy_base = enemy * 6
+
+        enemy_targets = pieces[enemy_base + KNIGHT] | pieces[enemy_base + BISHOP] | pieces[enemy_base + ROOK] | pieces[enemy_base + QUEEN]
+        bb = pieces[own_base + PAWN]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            count = _popcount(pawn_attacks[color * 64 + square] & enemy_targets)
+            if count > 0:
+                if color == 0:
+                    mg += THREAT_PAWN_ATTACK_BONUS_MG * count
+                else:
+                    mg -= THREAT_PAWN_ATTACK_BONUS_MG * count
+
+        enemy_pawns = pieces[enemy_base + PAWN]
+        enemy_knights = pieces[enemy_base + KNIGHT]
+        enemy_bishops = pieces[enemy_base + BISHOP]
+        enemy_rooks = pieces[enemy_base + ROOK]
+
+        for piece_type in (KNIGHT, BISHOP, ROOK, QUEEN):
+            bb = pieces[own_base + piece_type]
+            while bb != np.uint64(0):
+                square = _bit_scan(bb)
+                bb &= bb - np.uint64(1)
+
+                attacked_by_pawn = (pawn_attacks[enemy * 64 + square] & enemy_pawns) != np.uint64(0)
+
+                attacked_by_cheaper_minor = False
+                if piece_type == ROOK or piece_type == QUEEN:
+                    bishop_atk = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+                    attacked_by_cheaper_minor = (
+                        (knight_attacks[square] & enemy_knights) != np.uint64(0)
+                        or (bishop_atk & enemy_bishops) != np.uint64(0)
+                    )
+
+                attacked_by_cheaper_rook = False
+                if piece_type == QUEEN:
+                    rook_atk = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+                    attacked_by_cheaper_rook = (rook_atk & enemy_rooks) != np.uint64(0)
+
+                if not (attacked_by_pawn or attacked_by_cheaper_minor or attacked_by_cheaper_rook):
+                    continue
+
+                undefended = not is_square_attacked(
+                    pieces, square, color,
+                    rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                    bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                    knight_attacks, king_attacks, pawn_attacks,
+                )
+                if not undefended:
+                    continue
+
+                if attacked_by_pawn:
+                    penalty = THREAT_HANGING_TO_PAWN_PENALTY_MG
+                elif attacked_by_cheaper_minor:
+                    penalty = THREAT_HANGING_TO_MINOR_PENALTY_MG
+                else:
+                    penalty = THREAT_HANGING_TO_ROOK_PENALTY_MG
+
+                if color == 0:
+                    mg -= penalty
+                else:
+                    mg += penalty
+    return mg
+
+
 @njit(cache=False)
 def evaluate_from_state(eval_state, turn, pieces, castling_rights, alpha, beta,
                          rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                          bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-                         knight_attacks, king_attacks):
+                         knight_attacks, king_attacks, pawn_attacks):
     """Tapered score from ``turn``'s perspective, design doc §6 formula --
     same tapering as v1's cb_eval.py, just reading incrementally
     maintained material+PST totals instead of rescanning the board, plus
@@ -1390,10 +1501,14 @@ def evaluate_from_state(eval_state, turn, pieces, castling_rights, alpha, beta,
 
     lazy_score = (mg * phase_256 + eg * (256 - phase_256)) // 256
     lazy_score = lazy_score if turn == 0 else -lazy_score
+    # Tempo is added to whatever gets RETURNED, never to lazy_score itself
+    # before this point -- folding it in earlier would shift the window
+    # comparison below by a flat constant and change which positions take
+    # the short-circuit, which has nothing to do with what tempo means.
     if not ENABLE_EXTENDED_EVAL:
-        return lazy_score
+        return lazy_score + TEMPO_BONUS if ENABLE_TEMPO else lazy_score
     if lazy_score < alpha - LAZY_EVAL_MARGIN or lazy_score > beta + LAZY_EVAL_MARGIN:
-        return lazy_score
+        return lazy_score + TEMPO_BONUS if ENABLE_TEMPO else lazy_score
 
     pp_mg, pp_eg = _passed_pawn_score(pieces)
     ps_mg, ps_eg = _pawn_structure_score(pieces)
@@ -1407,8 +1522,15 @@ def evaluate_from_state(eval_state, turn, pieces, castling_rights, alpha, beta,
                                 knight_attacks, king_attacks)
     mg += pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg
     eg += pp_eg + ps_eg + rf_eg + bp_eg + mob_eg
+    if ENABLE_THREATS:
+        mg += _threats_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                              bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                              knight_attacks, king_attacks, pawn_attacks)
     score = (mg * phase_256 + eg * (256 - phase_256)) // 256
-    return score if turn == 0 else -score
+    score = score if turn == 0 else -score
+    if ENABLE_TEMPO:
+        score += TEMPO_BONUS
+    return score
 
 
 def new_eval_state(pieces):

@@ -133,7 +133,7 @@ def _eval_full(pieces, meta):
         f.new_eval_state(pieces), meta[0], pieces, meta[1], -_WIDE_WINDOW, _WIDE_WINDOW,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-        t.knight_attacks, t.king_attacks,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
     )
 
 
@@ -424,7 +424,7 @@ def test_evaluate_from_state_matches_v1_plus_pawn_structure_terms():
         eval_state, meta[0], pieces, meta[1], -_WIDE_WINDOW, _WIDE_WINDOW,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-        t.knight_attacks, t.king_attacks,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
     )
 
     pp_mg, pp_eg = f._passed_pawn_score(pieces)
@@ -441,13 +441,20 @@ def test_evaluate_from_state_matches_v1_plus_pawn_structure_terms():
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
         t.knight_attacks, t.king_attacks,
     )  # nonzero: both kings have a broken "shield" and sit on open files here
-    mg = eval_state[0] + pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg
+    threats_mg = f._threats_score(
+        pieces, t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
+        t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
+    ) if f.ENABLE_THREATS else 0  # gated the same way evaluate_from_state itself gates it
+    mg = eval_state[0] + pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg + threats_mg
     eg = eval_state[1] + pp_eg + ps_eg + rf_eg + bp_eg + mob_eg
     phase = eval_state[2]
     phase = min(phase, f.MAX_PHASE)
     phase_256 = (phase * 256) // f.MAX_PHASE
     combined = (mg * phase_256 + eg * (256 - phase_256)) // 256
     expected_from_formula = combined if meta[0] == 0 else -combined
+    if f.ENABLE_TEMPO:
+        expected_from_formula += f.TEMPO_BONUS
     assert got == expected_from_formula
 
     v1_material_pst = v1_eval.evaluate(chess.Board(_ONE_PAWN_EACH_FEN))
@@ -481,9 +488,10 @@ def test_lazy_eval_short_circuits_outside_the_window():
         eval_state, meta[0], pieces, meta[1], alpha, beta,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-        t.knight_attacks, t.king_attacks,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
     )
-    assert got == material_pst_only
+    expected = material_pst_only + f.TEMPO_BONUS if f.ENABLE_TEMPO else material_pst_only
+    assert got == expected
 
     full = _eval_full(pieces, meta)
     assert full != material_pst_only  # sanity: the full path really differs here
@@ -504,6 +512,6 @@ def test_lazy_eval_margin_boundary_does_not_short_circuit():
         eval_state, meta[0], pieces, meta[1], alpha, beta,
         t.rook_masks, t.rook_magics, t.rook_shifts, t.rook_offsets, t.rook_table,
         t.bishop_masks, t.bishop_magics, t.bishop_shifts, t.bishop_offsets, t.bishop_table,
-        t.knight_attacks, t.king_attacks,
+        t.knight_attacks, t.king_attacks, t.pawn_attacks,
     )
     assert got == _eval_full(pieces, meta)
