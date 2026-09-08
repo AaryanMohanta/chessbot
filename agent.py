@@ -35,6 +35,7 @@ the next one instead of crashing the process.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import traceback
@@ -43,6 +44,22 @@ _PROCESS_START = time.monotonic()  # first line, before any other import --
 # cb_nb_engine's compile deadline is measured from here, not from when its
 # own __init__ runs, so the (nontrivial) time spent importing numpy/numba/
 # chess below still counts against that deadline.
+
+# NUMBA_OPT (2026-09): must be set before numba is imported anywhere --
+# cb_nb_engine (below) is what transitively pulls it in. Measured
+# directly on this machine across repeated fresh-process compiles:
+# OPT=0 is catastrophic (769s compile vs. the ~77-82s all of 1/2/3 take,
+# and the resulting code itself runs at a fraction of normal speed) --
+# never use it. Among 1/2/3 (numba's own default), compile time is
+# statistically indistinguishable, but OPT=1 averaged ~7-8% higher nps
+# than the OPT=3 default across 4 repeated trials each (~198k vs ~184k),
+# with OPT=2 in between -- a real, if modest, effect: this codebase's
+# hot search loop leans on many small njit helper functions called in
+# deep chains, and LLVM's more aggressive inlining/unrolling passes at
+# higher OPT levels don't uniformly help code shaped like that. setdefault
+# (not a hard set) so an explicit NUMBA_OPT in the environment, e.g. for
+# a deliberate local A/B test, is never silently overridden.
+os.environ.setdefault("NUMBA_OPT", "1")
 
 import chess
 
