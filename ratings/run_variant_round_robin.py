@@ -14,12 +14,34 @@ case). Those games are a harness artifact, not a real chess result --
 excluded from the standings below, not counted as losses, and reported
 separately so the exclusion rate itself stays visible.
 
+CPU affinity pinning (2026-09): harness.match.AgentProcess already
+supports pinning a process to one dedicated core (white_cpu/black_cpu),
+added specifically because a soft, OS-scheduled CPU quota shared
+between concurrent compiling processes was observed to starve numba's
+compile badly enough to cause spurious init_budget_exceeded losses --
+but this script wasn't using it, so every concurrent game here was
+fighting the OS scheduler for cycles instead of getting a dedicated
+core. Note: a bug in the *old*, unpinned failure mode also mislabeled
+which side "failed" -- play_game checks white before black in a fixed
+dict order and returns on the first hit, so when both sides were
+actually starved, only white was ever reported. That was a reporting
+artifact, not evidence that white specifically was broken.
+
+Naive pinning (just handing out consecutive core indices) made things
+*worse*, not better, on this dev machine, and a second independent
+failure mode (memory pressure from unrelated background apps) compounded
+it -- see ratings/cpu_topology.py's module docstring for the full
+writeup and the shared PREFERRED_CORE_PAIRS/safe_concurrency this script
+now delegates to, so this file and ratings/sprt.py (which had the exact
+same naive-pinning bug) can't drift out of sync again.
+
 Usage: python -m ratings.run_variant_round_robin [--games-per-pairing N] [--concurrency C]
 """
 from __future__ import annotations
 
 import argparse
 import itertools
+import queue
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -27,8 +49,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from harness.match import play_game  # noqa: E402
+from harness.match import HARNESS_ARTIFACT_REASONS, play_game  # noqa: E402
 from ratings.book import OPENING_BOOK  # noqa: E402
+from ratings.cpu_topology import PREFERRED_CORE_PAIRS, safe_concurrency  # noqa: E402
 
 AGENT_PATH = str(REPO_ROOT / "agent.py")
 
@@ -43,9 +66,8 @@ VARIANTS = {
 DEFAULT_GAMES_PER_PAIRING = 10  # even, so it splits evenly across both colours
 DEFAULT_TIME_MS = 10_000
 DEFAULT_INCREMENT_MS = 100
-DEFAULT_CONCURRENCY = 10
-
-HARNESS_ARTIFACT_REASONS = ("white_init_budget_exceeded", "black_init_budget_exceeded")
+DEFAULT_CONCURRENCY = 5
+MAX_RETRIES_PER_GAME = 2  # a transient harness crash shouldn't just permanently lose that sample
 
 
 def _plan_games(games_per_pairing: int) -> list[tuple[str, str, str, str]]:
@@ -64,23 +86,44 @@ def _plan_games(games_per_pairing: int) -> list[tuple[str, str, str, str]]:
     return plan
 
 
-def _play_one(white_name, black_name, opening_id, fen, time_ms, increment_ms):
+def _play_one(white_name, black_name, opening_id, fen, time_ms, increment_ms, white_cpu, black_cpu):
     """Returns (white_name, black_name, opening_id, result_or_none) --
     None means a harness-level crash (e.g. numba/LLVM erroring or one
     side never sending a ready signal under heavy concurrent compile
     load -- see ratings/sprt.py's own _play_pair for the same transient
     failure, there too caught and excluded rather than allowed to take
-    down an entire run over one bad pairing)."""
+    down an entire run over one bad pairing). white_cpu/black_cpu pin
+    each side to its own dedicated core (see module docstring) --
+    None/None falls back to the unpinned, OS-scheduled behaviour."""
     try:
         result = play_game(
             AGENT_PATH, AGENT_PATH,
             time_ms=time_ms, increment_ms=increment_ms, start_fen=fen,
             white_env=VARIANTS[white_name], black_env=VARIANTS[black_name],
+            white_cpu=white_cpu, black_cpu=black_cpu,
         )
     except Exception as exc:
         print(f"  WARNING: {white_name} vs {black_name} ({opening_id}) crashed, excluding: {exc!r}", flush=True)
         return white_name, black_name, opening_id, None
     return white_name, black_name, opening_id, result
+
+
+def _play_one_with_retries(white_name, black_name, opening_id, fen, time_ms, increment_ms, white_cpu, black_cpu):
+    """A transient harness crash (memory pressure, an unlucky compile
+    under contention) shouldn't just permanently discard that sample --
+    retries within the same slot/core-pair up to MAX_RETRIES_PER_GAME
+    times before giving up and reporting it as a real exclusion."""
+    attempt = 0
+    while True:
+        white_name_, black_name_, opening_id_, result = _play_one(
+            white_name, black_name, opening_id, fen, time_ms, increment_ms, white_cpu, black_cpu)
+        is_artifact = result is None or result.reason in HARNESS_ARTIFACT_REASONS
+        attempt += 1
+        if not is_artifact or attempt > MAX_RETRIES_PER_GAME:
+            return white_name_, black_name_, opening_id_, result
+        reason = "harness crash" if result is None else result.reason
+        print(f"  RETRY {attempt}/{MAX_RETRIES_PER_GAME}: {white_name} vs {black_name} "
+              f"({opening_id}) after {reason}", flush=True)
 
 
 def main() -> int:
@@ -89,19 +132,50 @@ def main() -> int:
     parser.add_argument("--time-ms", type=float, default=DEFAULT_TIME_MS)
     parser.add_argument("--increment-ms", type=float, default=DEFAULT_INCREMENT_MS)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument("--no-cpu-pin", action="store_true",
+                         help="disable per-process CPU affinity pinning (falls back to OS-scheduled sharing)")
     args = parser.parse_args()
 
+    if args.no_cpu_pin:
+        concurrency = max(1, args.concurrency)
+    else:
+        concurrency, cpu_pin_ok = safe_concurrency(args.concurrency)
+        if not cpu_pin_ok:
+            args.no_cpu_pin = True
+        args.concurrency = concurrency
+
     plan = _plan_games(args.games_per_pairing)
-    print(f"Round robin: {len(VARIANTS)} variants, {len(plan)} games total, concurrency={args.concurrency}\n", flush=True)
+    pin_note = "unpinned (OS-scheduled)" if args.no_cpu_pin else "CPU-pinned, 2 dedicated cores/game"
+    print(f"Round robin: {len(VARIANTS)} variants, {len(plan)} games total, "
+          f"concurrency={args.concurrency} ({pin_note})\n", flush=True)
 
     scores: dict[str, float] = {name: 0.0 for name in VARIANTS}
     games_played: dict[str, int] = {name: 0 for name in VARIANTS}
     head_to_head: dict[tuple[str, str], list[float]] = {}
     errors = 0
 
+    # Bounded pool of exclusive core pairs -- acquired before a game starts,
+    # released when it ends (whether it succeeded, errored, or crashed), so
+    # at most `concurrency` games ever run at once and none of them share a
+    # core with another concurrently-running game.
+    core_pairs: "queue.Queue[tuple[int | None, int | None]]" = queue.Queue()
+    if args.no_cpu_pin:
+        for _ in range(args.concurrency):
+            core_pairs.put((None, None))
+    else:
+        for i in range(args.concurrency):
+            core_pairs.put(PREFERRED_CORE_PAIRS[i])
+
+    def _play_one_pinned(w, b, oid, fen):
+        white_cpu, black_cpu = core_pairs.get()
+        try:
+            return _play_one_with_retries(w, b, oid, fen, args.time_ms, args.increment_ms, white_cpu, black_cpu)
+        finally:
+            core_pairs.put((white_cpu, black_cpu))
+
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = [
-            executor.submit(_play_one, w, b, oid, fen, args.time_ms, args.increment_ms)
+            executor.submit(_play_one_pinned, w, b, oid, fen)
             for w, b, oid, fen in plan
         ]
         done = 0

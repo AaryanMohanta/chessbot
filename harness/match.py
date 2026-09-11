@@ -22,6 +22,19 @@ DEFAULT_INCREMENT_MS = 500
 MAX_OUTPUT_BYTES = 4096
 MAX_PLIES = 300  # matches the competition's own 300-ply adjudication-on-material rule
 
+# A GameResult with one of these reasons is a test-harness artifact (a
+# side's numba compile got starved past INIT_BUDGET_MS under concurrent
+# load), not a real chess result -- it comes back as an ordinary
+# GameResult (see the `side_init_budget_exceeded` return below), NOT an
+# exception, so a caller that only try/excepts around play_game() for
+# crash detection (a real risk: ratings/sprt.py's _play_pair did exactly
+# this for a while) will silently count a compile timeout as a genuine
+# loss for whichever side got starved. Any caller aggregating game
+# results for a strength comparison (round-robin, SPRT) MUST check
+# `result.reason not in HARNESS_ARTIFACT_REASONS` before trusting a
+# result, the same way it must catch play_game's real exceptions.
+HARNESS_ARTIFACT_REASONS = ("white_init_budget_exceeded", "black_init_budget_exceeded")
+
 # Score-based adjudication (self-play testing only -- see play_game's
 # ``adjudicate`` param and AgentProcess.request_move's optional score).
 # Long dead endgames are a large fraction of wall clock in dev SPRT and

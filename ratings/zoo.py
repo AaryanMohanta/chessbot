@@ -48,11 +48,21 @@ def snapshot_version(tag: str, notes: str = "") -> Path:
     # Zoo tags and build tags (see cb_build_tag.py) are the same kind of
     # thing -- "which config is this" -- so a zoo snapshot's build tag
     # defaults to its own zoo tag rather than falling back to the git-SHA
-    # default build() would otherwise pick.
-    build_zip.generate_build_tag_file(tag, {})
-    build_zip.check_imports(build_zip.SHIPPED_PY_FILES, errors)
+    # default build() would otherwise pick. Generated in-memory and
+    # written straight to dest/, never to the live repo root -- see
+    # build_zip.generate_build_tag_source's docstring: this function used
+    # to call generate_build_tag_file(tag, {}) with its default path
+    # (REPO_ROOT/cb_build_tag.py), which is exactly the mutate-the-shared-
+    # file bug that hit ratings/sprt.py's live testing twice in one
+    # session. A snapshot running concurrently with local self-play
+    # testing had the identical exposure.
+    build_tag_source = build_zip.generate_build_tag_source(tag, {})
+    build_zip.check_imports(build_zip.SHIPPED_PY_FILES, errors, source_overrides={"cb_build_tag.py": build_tag_source})
     build_zip.check_filename_shadowing(build_zip.SHIPPED_PY_FILES, errors)
-    shipped_paths = [REPO_ROOT / f for f in build_zip.SHIPPED_PY_FILES if (REPO_ROOT / f).exists()]
+    shipped_paths = [
+        REPO_ROOT / f for f in build_zip.SHIPPED_PY_FILES
+        if f != "cb_build_tag.py" and (REPO_ROOT / f).exists()
+    ]
     build_zip.check_forbidden_files(shipped_paths, errors)
     if errors:
         raise ValueError("refusing to snapshot, same checks build_zip.py enforces failed:\n" + "\n".join(errors))
@@ -60,11 +70,12 @@ def snapshot_version(tag: str, notes: str = "") -> Path:
     dest.mkdir(parents=True)
     for path in shipped_paths:
         shutil.copy2(path, dest / path.name)
+    (dest / "cb_build_tag.py").write_text(build_tag_source, encoding="utf-8")
 
     manifest = _load_manifest()
     manifest["versions"][tag] = {
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "files": sorted(p.name for p in shipped_paths),
+        "files": sorted([p.name for p in shipped_paths] + ["cb_build_tag.py"]),
         "notes": notes,
     }
     _save_manifest(manifest)
