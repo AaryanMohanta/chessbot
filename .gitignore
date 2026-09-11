@@ -46,3 +46,16 @@ cb_build_tag.py
 # ratings/ladder_games.csv (the parsed, structured record) IS tracked,
 # same reasoning as games.csv; the raw source files are not.
 ratings/ladder_logs/
+
+# Tuning/calibration byproducts (2026-09 repo cleanup): none of these are
+# read by the shipped engine or any test -- the actual tuned values get
+# hand-baked into cb_nb_pst_tuned.py as source (same "tuning data never
+# ships" policy as ratings/data/ above), and calibration_*.json is just a
+# point-in-time snapshot of a manual calibration run. Regenerate via
+# ratings/texel_tune.py, ratings/pst_tune.py, ratings/joint_tune.py, or
+# tools/calibrate_with_loss_capture.py rather than committing the output.
+ratings/texel_data.csv
+ratings/texel_tuned_weights*.json
+ratings/joint_tuned_weights.json
+ratings/pst_tuned_weights.json
+ratings/calibration_*.json
