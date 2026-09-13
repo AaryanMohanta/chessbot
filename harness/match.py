@@ -22,6 +22,19 @@ DEFAULT_INCREMENT_MS = 500
 MAX_OUTPUT_BYTES = 4096
 MAX_PLIES = 300  # matches the competition's own 300-ply adjudication-on-material rule
 
+# A GameResult with one of these reasons is a test-harness artifact (a
+# side's numba compile got starved past INIT_BUDGET_MS under concurrent
+# load), not a real chess result -- it comes back as an ordinary
+# GameResult (see the `side_init_budget_exceeded` return below), NOT an
+# exception, so a caller that only try/excepts around play_game() for
+# crash detection (a real risk: ratings/sprt.py's _play_pair did exactly
+# this for a while) will silently count a compile timeout as a genuine
+# loss for whichever side got starved. Any caller aggregating game
+# results for a strength comparison (round-robin, SPRT) MUST check
+# `result.reason not in HARNESS_ARTIFACT_REASONS` before trusting a
+# result, the same way it must catch play_game's real exceptions.
+HARNESS_ARTIFACT_REASONS = ("white_init_budget_exceeded", "black_init_budget_exceeded")
+
 # Score-based adjudication (self-play testing only -- see play_game's
 # ``adjudicate`` param and AgentProcess.request_move's optional score).
 # Long dead endgames are a large fraction of wall clock in dev SPRT and
@@ -59,10 +72,9 @@ class AgentProcess:
         # test-harness artifact, not real engine weakness.
         command = [sys.executable, _STDIO_RUNNER, agent_path]
         if cpu_affinity is not None and sys.platform.startswith("linux"):
-            # taskset doesn't exist on Windows -- silently skip pinning
-            # there rather than fail every subprocess launch. Local dev
-            # runs (Windows) get no pinning; the Linux reference
-            # container (and WSL) get real pinning.
+            # taskset doesn't exist on Windows -- pinned separately below
+            # via psutil instead, since Popen itself has no cross-platform
+            # affinity knob.
             command = ["taskset", "-c", str(cpu_affinity)] + command
         self.proc = subprocess.Popen(
             command,
@@ -73,15 +85,57 @@ class AgentProcess:
             bufsize=1,
             env=proc_env,
         )
+        if cpu_affinity is not None and sys.platform.startswith("win"):
+            # Windows has no taskset; psutil wraps SetProcessAffinityMask.
+            # Best-effort only (2026-09, for approximating the
+            # competition's "1 dedicated core" constraint on a Windows
+            # dev box) -- this pins to one CORE, it does NOT reproduce the
+            # reference hardware's actual clock speed (AMD EPYC 9V74 @
+            # 2.60 GHz), which Windows has no supported per-process knob
+            # for. Silently skipped if psutil isn't installed, same
+            # "don't fail the launch over a missing benchmarking nicety"
+            # policy as the Linux taskset path.
+            try:
+                import psutil
+                psutil.Process(self.proc.pid).cpu_affinity([cpu_affinity])
+            except Exception:
+                pass
         self.init_ms: float | None = None
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._reader = threading.Thread(target=self._pump_stdout, daemon=True)
         self._reader.start()
 
+        # stderr must be drained continuously too, not just lazily on an
+        # error path -- discovered via a real ~2-hour hang during a
+        # concurrent Stockfish calibration run (2026-09): once a child's
+        # stderr pipe (64KB on Windows) fills up because nobody is
+        # reading it, the child's own next print(..., file=sys.stderr)
+        # blocks forever inside the OS pipe write, which means it never
+        # gets back to reading stdin or writing stdout -- and this
+        # class's own request_move timeout, bounded on stdout alone,
+        # can't detect or recover from that: the child is alive and
+        # "responding" as far as the process table is concerned, just
+        # permanently stuck on a write() syscall. Kept bounded (last
+        # _STDERR_TAIL_CHARS) since a runaway warning loop could
+        # otherwise grow this without limit for the lifetime of the game.
+        self._stderr_lines: list[str] = []
+        self._stderr_lock = threading.Lock()
+        self._stderr_reader = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._stderr_reader.start()
+
     def _pump_stdout(self) -> None:
         try:
             for line in self.proc.stdout:
                 self._queue.put(line.rstrip("\n"))
+        except Exception:
+            pass
+
+    def _pump_stderr(self) -> None:
+        try:
+            for line in self.proc.stderr:
+                with self._stderr_lock:
+                    self._stderr_lines.append(line.rstrip("\n"))
+                    del self._stderr_lines[:-200]  # bounded tail, see __init__ comment
         except Exception:
             pass
 
@@ -146,15 +200,13 @@ class AgentProcess:
         return move, elapsed_ms, None, score
 
     def _drain_stderr(self, max_chars: int = 2000) -> str:
-        try:
-            self.proc.stderr.flush()
-        except Exception:
-            pass
-        try:
-            data = self.proc.stderr.read(max_chars) or ""
-        except Exception:
-            data = ""
-        return data
+        # Reads the tail buffer _pump_stderr has been continuously
+        # filling in the background -- must not read self.proc.stderr
+        # directly here, since that pipe now belongs exclusively to that
+        # thread (a second concurrent reader would race it).
+        with self._stderr_lock:
+            data = "\n".join(self._stderr_lines)
+        return data[-max_chars:]
 
     def close(self) -> None:
         """Close stdin (EOF) and give the process a chance to exit on its

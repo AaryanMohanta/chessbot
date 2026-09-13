@@ -73,3 +73,48 @@ def test_two_hundred_moves_never_exceed_hard_budget_or_go_negative(tm):
 
         time_left += increment
         ply += 2  # our move + the opponent's reply
+
+
+def test_six_hundred_ply_game_never_flags_even_at_worst_case_spend(tm):
+    """The 600-ply draw rule (2026-09, replacing the old 300-ply material
+    adjudication) makes a 300-of-our-own-moves game a real possibility,
+    not just a pathological edge case -- moves_to_go's floor of 15 was
+    tuned against ~47-move real games. Same worst-case-spend methodology
+    as the 200-move test above, extended to the new rule's actual limit,
+    both for the realistic case (always spend soft_ms) and the adversarial
+    one (always spend the full hard_ms)."""
+    increment = 500
+
+    for spend_field in ("soft_ms", "hard_ms"):
+        time_left = 120_000
+        ply = 0
+        for move_num in range(300):
+            budget = tm.budget(time_left, increment_ms=increment, ply=ply)
+            spend = getattr(budget, spend_field)
+            assert spend <= time_left, f"move {move_num} ({spend_field}): budget exceeds actual time left"
+
+            time_left -= spend
+            assert time_left >= 0, f"FLAGGED at move {move_num} spending {spend_field}"
+
+            time_left += increment
+            ply += 2
+
+
+def test_hard_floor_keeps_deep_endgame_budget_near_a_full_increment(tm):
+    """The concrete problem the floor fixes, not just "doesn't flag":
+    before this floor existed, hard_ms in the steady-state deep-endgame
+    regime (moves_to_go stuck at its floor) converged to well under half
+    an increment (~229ms out of a 500ms increment, ~46%) -- this asserts
+    it now converges to a comfortably larger fraction instead, since that
+    phase is exactly where actually converting or defending a long,
+    drawn-out position matters most under the new 600-ply rule."""
+    increment = 500
+    time_left = 120_000
+    ply = 0
+    for _ in range(200):  # run well past the point of reaching steady state
+        budget = tm.budget(time_left, increment_ms=increment, ply=ply)
+        time_left = time_left - budget.soft_ms + increment
+        ply += 2
+
+    final_budget = tm.budget(time_left, increment_ms=increment, ply=ply)
+    assert final_budget.hard_ms >= increment * 0.9

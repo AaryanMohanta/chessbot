@@ -32,6 +32,17 @@ from numba import njit
 
 import cb_nb_tables as T
 import cb_tables as V1_TABLES  # reuse the already-tuned v1 PST/material data
+import cb_nb_pst_tuned as PST_TUNED
+
+# CB_NB_TEXEL_TUNED_PST (default on): picks between cb_tables.py's
+# hand-set PST_MG/PST_EG and the ones ratings/pst_tune.py fit on the
+# full 725k-position dataset (material and the 37 scalar terms held
+# fixed -- see cb_nb_pst_tuned.py's own docstring for the held-out
+# validation number). Separate flag from CB_NB_TEXEL_TUNED since the two
+# were fit independently (PST tuning came after, holding the scalar
+# retune's output fixed as a base) and either should be independently
+# A/B-testable.
+_TEXEL_TUNED_PST = os.environ.get("CB_NB_TEXEL_TUNED_PST", "1") != "0"
 
 # Same env-var-flag pattern as cb_nb_search.py's CB_NB_ENABLE_KILLERS_HISTORY
 # etc.: lets ratings/sprt.py A/B the *same* compiled module with the six
@@ -39,6 +50,15 @@ import cb_tables as V1_TABLES  # reuse the already-tuned v1 PST/material data
 # bishop pair, mobility, king safety) on vs off, for the batch SPRT
 # against the material+PST-only baseline.
 ENABLE_EXTENDED_EVAL = os.environ.get("CB_NB_ENABLE_EXTENDED_EVAL", "1") != "0"
+
+# Item 3 of the 2026-09 3-change plan (cheap eval additions, one batch),
+# gated separately from ENABLE_EXTENDED_EVAL above -- that flag already
+# has a validated ON default from its own retest; a brand new, untested
+# batch shouldn't ride under the same flag, or reverting the new batch
+# alone would mean reverting six already-proven terms with it.
+ENABLE_TEMPO = os.environ.get("CB_NB_ENABLE_TEMPO", "0") != "0"
+ENABLE_THREATS = os.environ.get("CB_NB_ENABLE_THREATS", "0") != "0"
+TEMPO_BONUS = 15  # centipawns, side to move -- flat, not tapered by phase
 
 WHITE, BLACK = 0, 1
 PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = 0, 1, 2, 3, 4, 5
@@ -84,10 +104,20 @@ def _build_signed_pst():
         # its dicts by python-chess's own 1-indexed constants (PAWN=1..
         # KING=6) -- +1 bridges the two conventions.
         chess_pt = pt + 1
-        mg_val = V1_TABLES.PIECE_VALUES_MG[chess_pt]
-        eg_val = V1_TABLES.PIECE_VALUES_EG[chess_pt]
-        mg_pst = V1_TABLES.PST_MG[chess_pt]
-        eg_pst = V1_TABLES.PST_EG[chess_pt]
+        if _TEXEL_TUNED_PST:
+            # Material values here come from the SAME joint fit as the
+            # PST cells below (ratings/joint_tune.py) -- mixing this PST
+            # with the old hand-set material (or vice versa) was never
+            # validated, so both switch on the one flag together.
+            mg_val = PST_TUNED.PIECE_VALUES_MG[chess_pt]
+            eg_val = PST_TUNED.PIECE_VALUES_EG[chess_pt]
+            mg_pst = PST_TUNED.PST_MG[chess_pt]
+            eg_pst = PST_TUNED.PST_EG[chess_pt]
+        else:
+            mg_val = V1_TABLES.PIECE_VALUES_MG[chess_pt]
+            eg_val = V1_TABLES.PIECE_VALUES_EG[chess_pt]
+            mg_pst = V1_TABLES.PST_MG[chess_pt]
+            eg_pst = V1_TABLES.PST_EG[chess_pt]
         weight = V1_TABLES.PHASE_WEIGHTS[chess_pt]
 
         white_idx = 0 * 6 + pt
@@ -105,13 +135,47 @@ def _build_signed_pst():
 
 PST_SIGNED_MG, PST_SIGNED_EG, PHASE_WEIGHT_BY_IDX = _build_signed_pst()
 
+# CB_NB_TEXEL_TUNED (default on): picks between the original hand-set
+# scalar weights below ("just be nonzero, Texel tuning finds the real
+# values later") and the values an actual Texel tune produced.
+#
+# Retuned 2026-09 on the real Zurichess quiet-labeled.epd (725,000
+# positions -- see ratings/data/quiet_labeled.csv, converted via
+# tools/convert_quiet_labeled.py), replacing the first pass's 8,578
+# self-play positions (ratings/texel_data.csv, kept only as a smaller
+# fallback dataset). reg_lambda scaled down from 5e-7 to 5.9e-9
+# (proportional to the ~85x data increase -- see texel_error's docstring
+# on why the raw value doesn't self-scale with dataset size) so the much
+# larger sample is actually allowed to move weights away from the prior;
+# this is what fixed the previous tune's clamped-near-zero mobility
+# weights (mob_knight_mg/mob_bishop_mg were 5 either way, but
+# mob_knight_eg was clamped from -1 to 0 -- now a real, comfortably
+# positive 8, not just "not negative").
+#
+# Three tuner outputs still came back negative and were clamped to 0
+# before shipping, same policy as the first pass: mob_queen_mg (-2),
+# king_shield_mg (-4), king_castled_mg (-1). The first is "more mobility
+# is bad," already established as not something a dataset gets to
+# overrule regardless of size; the latter two are worse -- a shielded or
+# actually-castled king scoring as LESS safe than an unshielded,
+# uncastled one is chess-nonsensical, and given how small all three
+# magnitudes are (comfortably inside noise), reads as leftover
+# collinearity between the king-safety sub-features rather than real
+# signal. Left un-clamped: rook_open_eg (-13), a small enough magnitude
+# on a weakly-informative endgame feature that a real "file control
+# matters less once rook activity comes from king/pawn proximity
+# instead" effect is plausible, unlike the three above.
+_TEXEL_TUNED = os.environ.get("CB_NB_TEXEL_TUNED", "1") != "0"
+
 # Passed-pawn bonus by relative rank (0 = own back rank, 7 = the square
 # it'd promote from -- unreachable for a pawn still on the board, kept
-# at 0 for safety). Values are a reasonable starting curve, not tuned --
-# Texel tuning is the explicit later step for refining constants like
-# these, not this one.
-PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
-PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
+# at 0 for safety).
+if _TEXEL_TUNED:
+    PASSED_PAWN_BONUS_MG = np.array([0, 8, 8, 2, 19, 40, 88, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_EG = np.array([0, 58, 48, 67, 93, 153, 188, 0], dtype=np.int64)
+else:
+    PASSED_PAWN_BONUS_MG = np.array([0, 5, 10, 20, 35, 60, 100, 0], dtype=np.int64)
+    PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64)
 
 # Lazy eval: material+PST alone is decisive often enough (a position way
 # outside the search window won't be changed by refining pawn structure/
@@ -120,36 +184,124 @@ PASSED_PAWN_BONUS_EG = np.array([0, 10, 20, 35, 60, 100, 150, 0], dtype=np.int64
 # [alpha, beta] window by more than this margin, it's returned as-is.
 LAZY_EVAL_MARGIN = 250
 
-# Isolated/doubled pawn penalties -- same "starting curve, not tuned"
-# caveat as the passed-pawn bonuses above.
-ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
-DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
+# King-to-passed-pawn race bonus (2026-09, endgame pass): per unit of
+# (enemy king's Chebyshev distance to the pawn's promotion square minus
+# our own king's distance to it), EG-only. Was added after the first
+# Texel pass ran, so it shipped un-tuned (a flat 5) for one round; now
+# folded into CB_NB_TEXEL_TUNED like every other term now that
+# ratings/texel_features.py extracts it too.
+if _TEXEL_TUNED:
+    KING_PAWN_PROXIMITY_WEIGHT_EG = 15
+else:
+    KING_PAWN_PROXIMITY_WEIGHT_EG = 5
+
+if _TEXEL_TUNED:
+    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 26, 11
+    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 15, 30
+else:
+    ISOLATED_PENALTY_MG, ISOLATED_PENALTY_EG = 12, 20
+    DOUBLED_PENALTY_MG, DOUBLED_PENALTY_EG = 10, 15
 
 # Rook on an open (no pawns of either colour) or semi-open (no *own*
 # pawns) file. Bigger in the middlegame, where an open file is a real
 # attacking asset; smaller in the endgame, where rook activity tends to
 # come from king/pawn proximity more than file control.
-ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
-ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
+if _TEXEL_TUNED:
+    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 72, -13
+    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 31, 19
+else:
+    ROOK_OPEN_FILE_BONUS_MG, ROOK_OPEN_FILE_BONUS_EG = 20, 10
+    ROOK_SEMI_OPEN_FILE_BONUS_MG, ROOK_SEMI_OPEN_FILE_BONUS_EG = 10, 5
 
 # Bishop pair: two bishops covering both square colours are worth more
 # than the sum of two same-colour minor pieces, especially as the board
 # opens up in the endgame.
-BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
+if _TEXEL_TUNED:
+    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 52, 51
+else:
+    BISHOP_PAIR_BONUS_MG, BISHOP_PAIR_BONUS_EG = 15, 30
 
-# King safety: deliberately small weights (see _king_safety_score) --
-# Texel tuning is what finds the real values later; this only needs to
-# be present and not actively harmful. Middlegame-only (no EG term):
-# king safety matters far less once material is traded off, and kings
-# often want to be active/central in the endgame rather than sheltered.
-KING_SHIELD_PENALTY_MG = 10  # per missing pawn in the 3-square shield in front of the king
-KING_OPEN_FILE_PENALTY_MG = 15  # king's own file has no pawns of either colour
-KING_SEMI_OPEN_FILE_PENALTY_MG = 8  # king's own file has no *own* pawns (enemy pawns may be present)
+# King safety, middlegame-only (no EG term): king safety matters far
+# less once material is traded off, and kings often want to be active/
+# central in the endgame rather than sheltered.
+#
+# Retest (2026-09): weights raised substantially from the original
+# "just be nonzero, Texel tuning finds the real values later" starting
+# point, after a real ladder loss (round 4) where the engine never
+# castled, wrecked its own kingside pawns, and pushed queenside pawns
+# while exposed -- the old weights (max realistic total ~15-70cp) were
+# far too small to ever outweigh other eval terms, so the engine had
+# effectively no opinion on king safety at all. Still Texel-tuning-
+# pending like every other weight here, but "not actively harmful" is
+# no longer the bar.
+#
+# CB_NB_KING_SAFETY_V2 (default on) picks between this new set and the
+# original small-weights set -- same env-var-flag pattern as every other
+# toggle in this file, here so the retest can A/B the whole batch (raised
+# weights + castling incentive) in one SPRT against the original values,
+# not because the shipped default is ever meant to be "0".
+_KING_SAFETY_V2 = os.environ.get("CB_NB_KING_SAFETY_V2", "1") != "0"
+
+if _KING_SAFETY_V2 and _TEXEL_TUNED:
+    # king_shield_mg and king_castled_mg came back negative from the
+    # retune (-4, -1) -- a shielded or actually-castled king scoring as
+    # LESS safe than the alternative is chess-nonsensical, and the
+    # magnitudes are small enough (well inside noise) to read as
+    # collinearity between the king-safety sub-features rather than a
+    # real effect. Rather than clamp to 0 (making the term fully inert),
+    # these two specifically fall back to the previous tune's values --
+    # not the hand-set original, the ones already validated by a real
+    # ladder loss (round 4: no castling, wrecked kingside shield, exposed
+    # queenside push) that this exact retune would otherwise silently
+    # erase evidence for. See the CB_NB_TEXEL_TUNED comment above.
+    KING_SHIELD_PENALTY_MG = 26
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 6
+    KING_OPEN_FILE_PENALTY_MG = 60
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 11
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 8
+    CASTLED_BONUS_MG = 33
+    UNCASTLED_EXPOSED_PENALTY_MG = 52
+elif _KING_SAFETY_V2:
+    KING_SHIELD_PENALTY_MG = 25  # per missing pawn in the 3-square shield in front of the king
+    # Extra shield penalty per missing pawn, scaled by how much attacking
+    # material the opponent still has (see KING_ATTACKER_WEIGHT-style
+    # reasoning below) -- a wrecked shield in a queen+rooks middlegame is
+    # dangerous; the same wrecked shield once the opponent's queen and
+    # rooks are gone barely matters.
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 6
+    KING_OPEN_FILE_PENALTY_MG = 35  # king's own file has no pawns of either colour
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 18  # king's own file has no *own* pawns (enemy pawns may be present)
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 10
+    # Castling incentive, deliberately separate from the structural terms
+    # above: a flat bonus for having actually castled (king on g1/c1 or
+    # g8/c8 with no remaining rights -- the only way to reach that square
+    # with rights already gone, short of an extremely unlikely manual
+    # walk), and a flat penalty for having *lost* castling rights without
+    # castling while the opponent still has real attacking material (a
+    # queen or a rook) -- exactly the round-4 pattern: king stuck near
+    # the centre, queen and rooks still on the board on both sides. No
+    # penalty once the opponent's queen and rooks are gone -- an
+    # uncastled king in a quiet, major-piece-free position isn't a safety
+    # problem, it's normal endgame/simplified play.
+    CASTLED_BONUS_MG = 45
+    UNCASTLED_EXPOSED_PENALTY_MG = 40
+else:
+    KING_SHIELD_PENALTY_MG = 10
+    KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG = 0
+    KING_OPEN_FILE_PENALTY_MG = 15
+    KING_SEMI_OPEN_FILE_PENALTY_MG = 8
+    KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
+    CASTLED_BONUS_MG = 0
+    UNCASTLED_EXPOSED_PENALTY_MG = 0
+
 # Indexed PAWN..KING; only KNIGHT/BISHOP/ROOK/QUEEN are nonzero -- how
 # dangerous one enemy piece of this type attacking the king's immediate
-# zone is considered.
+# zone is considered. Also reused (queen/rook units only) as the
+# "attacking material" scale for the shield-material-bonus and
+# uncastled-exposure penalty above. Unaffected by CB_NB_KING_SAFETY_V2.
 KING_ATTACKER_WEIGHT = np.array([0, 1, 1, 2, 4, 0], dtype=np.int64)
-KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
+ATTACKING_MATERIAL_QUEEN_UNITS = 3
+ATTACKING_MATERIAL_ROOK_UNITS = 1
 
 # Mobility: per-square bonus for each pseudo-legally reachable square not
 # occupied by a piece of the same colour, weighted by piece type
@@ -159,8 +311,18 @@ KING_ATTACKER_PENALTY_PER_UNIT_MG = 4
 # latter naturally reach far more squares, so an equal per-square weight
 # would overweight them relative to how much any one extra square
 # actually matters.
-MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
-MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)
+if _TEXEL_TUNED:
+    # mob_queen_mg came back slightly negative from the retune (-2) --
+    # clamped to 0 rather than shipped negative, see the
+    # CB_NB_TEXEL_TUNED comment above ("more mobility is bad" isn't
+    # something a dataset gets to overrule regardless of size).
+    # mob_rook_mg is genuinely 0, not clamped -- that's what the tune
+    # returned directly.
+    MOBILITY_UNIT_MG = np.array([0, 12, 8, 0, 0, 0], dtype=np.int64)
+    MOBILITY_UNIT_EG = np.array([0, 8, 7, 15, 24, 0], dtype=np.int64)
+else:
+    MOBILITY_UNIT_MG = np.array([0, 4, 3, 2, 1, 0], dtype=np.int64)
+    MOBILITY_UNIT_EG = np.array([0, 2, 3, 2, 2, 0], dtype=np.int64)
 
 # Rebound to plain module-level names (not accessed as T.PASSED_PAWN_MASK
 # etc.) so they resolve as njit globals the same well-established way
@@ -421,9 +583,14 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     push_dir = 8 if color == 0 else -8
 
     h = zobrist[0]
+    ph = zobrist[1]  # pawn-only hash (CorrHist, 2026-09) -- same random
+    # values as h's zobrist_piece table, XORed only for pawn bitboard
+    # changes; see pawn_zobrist_hash_from_scratch's own docstring.
     mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
 
     h ^= zobrist_piece[piece_idx, from_sq]
+    if piece_type == PAWN:
+        ph ^= zobrist_piece[piece_idx, from_sq]
     mg -= pst_mg[piece_idx, from_sq]
     eg -= pst_eg[piece_idx, from_sq]
     phase -= phase_weight[piece_idx]
@@ -436,6 +603,7 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
         pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(captured_square))
         mailbox[captured_square] = -1
         h ^= zobrist_piece[captured_idx, captured_square]
+        ph ^= zobrist_piece[captured_idx, captured_square]  # en passant always captures a pawn
         mg -= pst_mg[captured_idx, captured_square]
         eg -= pst_eg[captured_idx, captured_square]
         phase -= phase_weight[captured_idx]
@@ -446,6 +614,8 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
             undo_captured_square = to_sq
             pieces[captured_idx] &= ~(np.uint64(1) << np.uint64(to_sq))
             h ^= zobrist_piece[captured_idx, to_sq]
+            if captured_idx % 6 == PAWN:
+                ph ^= zobrist_piece[captured_idx, to_sq]
             mg -= pst_mg[captured_idx, to_sq]
             eg -= pst_eg[captured_idx, to_sq]
             phase -= phase_weight[captured_idx]
@@ -457,6 +627,8 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     mailbox[from_sq] = -1
     mailbox[to_sq] = final_piece_idx
     h ^= zobrist_piece[final_piece_idx, to_sq]
+    if final_piece_type == PAWN:
+        ph ^= zobrist_piece[final_piece_idx, to_sq]
     mg += pst_mg[final_piece_idx, to_sq]
     eg += pst_eg[final_piece_idx, to_sq]
     phase += phase_weight[final_piece_idx]
@@ -510,6 +682,7 @@ def make_move(pieces, mailbox, meta, move, castle_rook_from, castle_rook_to, cas
     meta[3] = new_halfmove
     meta[4] = meta[4] + (1 if color == 1 else 0)
     zobrist[0] = h
+    zobrist[1] = ph
     eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
     return undo_castling_rights, undo_ep_square, undo_halfmove_clock, undo_captured_piece, undo_captured_square
@@ -545,9 +718,12 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     original_piece_idx = color * 6 + original_piece_type
 
     h = zobrist[0]
+    ph = zobrist[1]  # pawn-only hash (CorrHist, 2026-09) -- see make_move
     mg, eg, phase = eval_state[0], eval_state[1], eval_state[2]
 
     h ^= zobrist_piece[final_piece_idx, to_sq]
+    if final_piece_type == PAWN:
+        ph ^= zobrist_piece[final_piece_idx, to_sq]
     mg -= pst_mg[final_piece_idx, to_sq]
     eg -= pst_eg[final_piece_idx, to_sq]
     phase -= phase_weight[final_piece_idx]
@@ -557,6 +733,8 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     mailbox[to_sq] = -1
     mailbox[from_sq] = original_piece_idx
     h ^= zobrist_piece[original_piece_idx, from_sq]
+    if original_piece_type == PAWN:
+        ph ^= zobrist_piece[original_piece_idx, from_sq]
     mg += pst_mg[original_piece_idx, from_sq]
     eg += pst_eg[original_piece_idx, from_sq]
     phase += phase_weight[original_piece_idx]
@@ -579,6 +757,8 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
         pieces[undo_captured_piece] |= np.uint64(1) << np.uint64(undo_captured_square)
         mailbox[undo_captured_square] = undo_captured_piece
         h ^= zobrist_piece[undo_captured_piece, undo_captured_square]
+        if undo_captured_piece % 6 == PAWN:
+            ph ^= zobrist_piece[undo_captured_piece, undo_captured_square]
         mg += pst_mg[undo_captured_piece, undo_captured_square]
         eg += pst_eg[undo_captured_piece, undo_captured_square]
         phase += phase_weight[undo_captured_piece]
@@ -592,6 +772,7 @@ def unmake_move(pieces, mailbox, meta, move, undo_castling_rights, undo_ep_squar
     h ^= zobrist_side
 
     zobrist[0] = h
+    zobrist[1] = ph
     eval_state[0], eval_state[1], eval_state[2] = mg, eg, phase
 
 
@@ -808,6 +989,27 @@ def compute_hash(pieces, meta) -> int:
 
 
 @njit(cache=False)
+def pawn_zobrist_hash_from_scratch(pieces, zobrist_piece):
+    """Same zobrist_piece random values as the main hash, restricted to
+    the two pawn bitboards (idx PAWN=0 white, idx 6+PAWN=6 black) -- see
+    CorrHist's own comment in cb_nb_search.py for why this exists as a
+    hash of its own rather than reusing the main key."""
+    h = np.uint64(0)
+    for idx in (PAWN, 6 + PAWN):
+        bb = pieces[idx]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            h ^= zobrist_piece[idx, square]
+    return h
+
+
+def compute_pawn_hash(pieces) -> int:
+    t = _TABLES
+    return int(pawn_zobrist_hash_from_scratch(pieces, t.zobrist_piece))
+
+
+@njit(cache=False)
 def eval_state_from_scratch(pieces, pst_mg, pst_eg, phase_weight):
     mg = np.int64(0)
     eg = np.int64(0)
@@ -943,24 +1145,28 @@ def _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, 
 
 
 @njit(cache=False)
-def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+def _king_safety_score(pieces, castling_rights, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                         bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                         knight_attacks, king_attacks):
-    """White-minus-black middlegame-only king safety penalty (see the
-    KING_* constants above for why the weights are deliberately small):
+    """White-minus-black middlegame-only king safety penalty:
 
       - pawn shield: the 3 squares one rank in front of the king (its own
-        file and the two adjacent ones) -- a penalty per missing pawn.
+        file and the two adjacent ones) -- a penalty per missing pawn,
+        scaled up by how much attacking material (queen/rooks) the
+        opponent still has.
       - king's own file open (no pawns of either colour) or semi-open
         (no *own* pawns) -- undefended by a friendly pawn wall.
       - enemy knights/bishops/rooks/queens that pseudo-legally attack any
         square in the king's immediate zone (its square + 8 neighbours,
         via king_attacks -- reused as a "zone" mask, not a legal-king-
         move check), weighted by piece type.
+      - castling incentive: bonus for having castled, penalty for having
+        lost the right to without castling while the opponent still has
+        real attacking material (see CASTLED_BONUS_MG's comment).
 
     Reuses mobility's exact same attack-table parameters (already
-    threaded through evaluate_from_state), so this adds no new plumbing
-    beyond king_attacks itself."""
+    threaded through evaluate_from_state); castling_rights is meta[1],
+    threaded in by every caller alongside the position itself."""
     mg = 0
     occ = occupied_all(pieces)
     for color in (0, 1):
@@ -971,13 +1177,18 @@ def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offset
         enemy_pawns = pieces[enemy * 6 + PAWN]
         penalty = 0
 
+        attacking_units = (
+            _popcount(pieces[enemy * 6 + QUEEN]) * ATTACKING_MATERIAL_QUEEN_UNITS
+            + _popcount(pieces[enemy * 6 + ROOK]) * ATTACKING_MATERIAL_ROOK_UNITS
+        )
+
         shield_rank = king_rank + 1 if color == 0 else king_rank - 1
         if 0 <= shield_rank < 8:
             for f in (king_file - 1, king_file, king_file + 1):
                 if 0 <= f < 8:
                     shield_sq = shield_rank * 8 + f
                     if (own_pawns & (np.uint64(1) << np.uint64(shield_sq))) == np.uint64(0):
-                        penalty += KING_SHIELD_PENALTY_MG
+                        penalty += KING_SHIELD_PENALTY_MG + KING_SHIELD_MATERIAL_BONUS_PER_UNIT_MG * attacking_units
 
         king_file_mask = _FILE_MASKS[king_file]
         if (own_pawns & king_file_mask) == np.uint64(0):
@@ -1022,6 +1233,19 @@ def _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offset
                 attacker_weight += KING_ATTACKER_WEIGHT[QUEEN]
 
         penalty += attacker_weight * KING_ATTACKER_PENALTY_PER_UNIT_MG
+
+        king_side_bit = np.int64(1) if color == 0 else np.int64(4)
+        queen_side_bit = np.int64(2) if color == 0 else np.int64(8)
+        has_rights = (castling_rights & (king_side_bit | queen_side_bit)) != 0
+        castled_kingside_sq = 6 if color == 0 else 62
+        castled_queenside_sq = 2 if color == 0 else 58
+        is_on_castled_square = king_sq == castled_kingside_sq or king_sq == castled_queenside_sq
+
+        if not has_rights:
+            if is_on_castled_square:
+                penalty -= CASTLED_BONUS_MG
+            elif attacking_units > 0:
+                penalty += UNCASTLED_EXPOSED_PENALTY_MG
 
         if color == 0:
             mg -= penalty
@@ -1082,20 +1306,39 @@ def _rook_file_score(pieces):
 
 
 @njit(cache=False)
+def _chebyshev_distance(sq_a, sq_b):
+    file_diff = abs((sq_a % 8) - (sq_b % 8))
+    rank_diff = abs((sq_a // 8) - (sq_b // 8))
+    return file_diff if file_diff > rank_diff else rank_diff
+
+
+@njit(cache=False)
 def _passed_pawn_score(pieces):
-    """White-minus-black (mg, eg) passed-pawn bonus. Unlike material/PST,
-    this isn't maintained incrementally through make_move/unmake_move --
-    "is this pawn's file-triple clear of enemy pawns" doesn't decompose
-    into a simple per-move delta the way a piece landing on/leaving a
+    """White-minus-black (mg, eg) passed-pawn bonus, plus (2026-09,
+    endgame-strength pass) a king-proximity term, EG-only: for each
+    passed pawn, the side whose king is closer to that pawn's promotion
+    square than the opponent's king gets a bonus scaled by the distance
+    difference. This is one of the most standard, highest-value
+    endgame heuristics in any engine ("the side with the active king
+    wins king-and-pawn races") and was entirely absent before -- the
+    king's EG PST already rewards general centralization, but has no
+    idea a specific passed pawn needs escorting or stopping.
+
+    Unlike material/PST, none of this is maintained incrementally
+    through make_move/unmake_move -- "is this pawn's file-triple clear
+    of enemy pawns" and "how far is each king from here" don't decompose
+    into simple per-move deltas the way a piece landing on/leaving a
     square does, so it's recomputed from the piece bitboards at every
     leaf eval instead (cheap: a handful of pawns, one mask-and-compare
-    each)."""
+    and two distance checks each)."""
     mg = 0
     eg = 0
     for color in (0, 1):
         enemy = 1 - color
         own_pawns = pieces[color * 6 + PAWN]
         enemy_pawns = pieces[enemy * 6 + PAWN]
+        own_king_sq = _bit_scan(pieces[color * 6 + KING])
+        enemy_king_sq = _bit_scan(pieces[enemy * 6 + KING])
         bb = own_pawns
         while bb != np.uint64(0):
             square = _bit_scan(bb)
@@ -1104,20 +1347,127 @@ def _passed_pawn_score(pieces):
             if (enemy_pawns & mask) == np.uint64(0):
                 rank = square // 8
                 rel_rank = rank if color == 0 else 7 - rank
+                file = square % 8
+                promo_sq = file + (56 if color == 0 else 0)
+                own_dist = _chebyshev_distance(own_king_sq, promo_sq)
+                enemy_dist = _chebyshev_distance(enemy_king_sq, promo_sq)
+                king_bonus_eg = KING_PAWN_PROXIMITY_WEIGHT_EG * (enemy_dist - own_dist)
                 if color == 0:
                     mg += PASSED_PAWN_BONUS_MG[rel_rank]
-                    eg += PASSED_PAWN_BONUS_EG[rel_rank]
+                    eg += PASSED_PAWN_BONUS_EG[rel_rank] + king_bonus_eg
                 else:
                     mg -= PASSED_PAWN_BONUS_MG[rel_rank]
-                    eg -= PASSED_PAWN_BONUS_EG[rel_rank]
+                    eg -= PASSED_PAWN_BONUS_EG[rel_rank] + king_bonus_eg
     return mg, eg
 
 
+THREAT_PAWN_ATTACK_BONUS_MG = 20  # per enemy N/B/R/Q one of our pawns attacks
+THREAT_HANGING_TO_PAWN_PENALTY_MG = 40  # our N/B/R/Q, undefended, attacked by an enemy pawn
+THREAT_HANGING_TO_MINOR_PENALTY_MG = 30  # our R/Q, undefended, attacked by an enemy N/B
+THREAT_HANGING_TO_ROOK_PENALTY_MG = 25  # our Q, undefended, attacked by an enemy R
+
+
 @njit(cache=False)
-def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
+def _threats_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                    bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                    knight_attacks, king_attacks, pawn_attacks):
+    """White-minus-black (mg-only) threat bonus/penalty (2026-09) --
+    Stockfish's largest non-material eval group, previously entirely
+    absent here. Two cheap, unambiguous cases rather than a full
+    SEE-per-piece sweep:
+
+      1. A bonus for each enemy minor/major piece one of our pawns
+         attacks -- a pawn is the cheapest attacker there is, so this is
+         a genuine threat regardless of what defends the target.
+      2. A penalty for each of our OWN minor/major pieces that is BOTH
+         undefended (not is_square_attacked by our own side) AND
+         attacked by a strictly cheaper enemy piece: a pawn attacking
+         anything; a knight or bishop attacking a rook or queen; a rook
+         attacking a queen. Two pieces of the same conventional value
+         (e.g. a knight attacked by a bishop) do NOT count -- neither is
+         "cheaper" than the other.
+
+    A piece hanging to a cheaper attacker is a near-forced material loss
+    the search may not see if it's outside the line currently being
+    read -- exactly the kind of static signal a cheap eval term exists
+    to catch, independent of anything mobility/king-safety above already
+    cover."""
+    mg = 0
+    occ = occupied_all(pieces)
+    for color in (0, 1):
+        enemy = 1 - color
+        own_base = color * 6
+        enemy_base = enemy * 6
+
+        enemy_targets = pieces[enemy_base + KNIGHT] | pieces[enemy_base + BISHOP] | pieces[enemy_base + ROOK] | pieces[enemy_base + QUEEN]
+        bb = pieces[own_base + PAWN]
+        while bb != np.uint64(0):
+            square = _bit_scan(bb)
+            bb &= bb - np.uint64(1)
+            count = _popcount(pawn_attacks[color * 64 + square] & enemy_targets)
+            if count > 0:
+                if color == 0:
+                    mg += THREAT_PAWN_ATTACK_BONUS_MG * count
+                else:
+                    mg -= THREAT_PAWN_ATTACK_BONUS_MG * count
+
+        enemy_pawns = pieces[enemy_base + PAWN]
+        enemy_knights = pieces[enemy_base + KNIGHT]
+        enemy_bishops = pieces[enemy_base + BISHOP]
+        enemy_rooks = pieces[enemy_base + ROOK]
+
+        for piece_type in (KNIGHT, BISHOP, ROOK, QUEEN):
+            bb = pieces[own_base + piece_type]
+            while bb != np.uint64(0):
+                square = _bit_scan(bb)
+                bb &= bb - np.uint64(1)
+
+                attacked_by_pawn = (pawn_attacks[enemy * 64 + square] & enemy_pawns) != np.uint64(0)
+
+                attacked_by_cheaper_minor = False
+                if piece_type == ROOK or piece_type == QUEEN:
+                    bishop_atk = bishop_attacks_fast(square, occ, bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table)
+                    attacked_by_cheaper_minor = (
+                        (knight_attacks[square] & enemy_knights) != np.uint64(0)
+                        or (bishop_atk & enemy_bishops) != np.uint64(0)
+                    )
+
+                attacked_by_cheaper_rook = False
+                if piece_type == QUEEN:
+                    rook_atk = rook_attacks_fast(square, occ, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table)
+                    attacked_by_cheaper_rook = (rook_atk & enemy_rooks) != np.uint64(0)
+
+                if not (attacked_by_pawn or attacked_by_cheaper_minor or attacked_by_cheaper_rook):
+                    continue
+
+                undefended = not is_square_attacked(
+                    pieces, square, color,
+                    rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                    bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                    knight_attacks, king_attacks, pawn_attacks,
+                )
+                if not undefended:
+                    continue
+
+                if attacked_by_pawn:
+                    penalty = THREAT_HANGING_TO_PAWN_PENALTY_MG
+                elif attacked_by_cheaper_minor:
+                    penalty = THREAT_HANGING_TO_MINOR_PENALTY_MG
+                else:
+                    penalty = THREAT_HANGING_TO_ROOK_PENALTY_MG
+
+                if color == 0:
+                    mg -= penalty
+                else:
+                    mg += penalty
+    return mg
+
+
+@njit(cache=False)
+def evaluate_from_state(eval_state, turn, pieces, castling_rights, alpha, beta,
                          rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                          bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
-                         knight_attacks, king_attacks):
+                         knight_attacks, king_attacks, pawn_attacks):
     """Tapered score from ``turn``'s perspective, design doc §6 formula --
     same tapering as v1's cb_eval.py, just reading incrementally
     maintained material+PST totals instead of rescanning the board, plus
@@ -1151,10 +1501,14 @@ def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
 
     lazy_score = (mg * phase_256 + eg * (256 - phase_256)) // 256
     lazy_score = lazy_score if turn == 0 else -lazy_score
+    # Tempo is added to whatever gets RETURNED, never to lazy_score itself
+    # before this point -- folding it in earlier would shift the window
+    # comparison below by a flat constant and change which positions take
+    # the short-circuit, which has nothing to do with what tempo means.
     if not ENABLE_EXTENDED_EVAL:
-        return lazy_score
+        return lazy_score + TEMPO_BONUS if ENABLE_TEMPO else lazy_score
     if lazy_score < alpha - LAZY_EVAL_MARGIN or lazy_score > beta + LAZY_EVAL_MARGIN:
-        return lazy_score
+        return lazy_score + TEMPO_BONUS if ENABLE_TEMPO else lazy_score
 
     pp_mg, pp_eg = _passed_pawn_score(pieces)
     ps_mg, ps_eg = _pawn_structure_score(pieces)
@@ -1163,13 +1517,20 @@ def evaluate_from_state(eval_state, turn, pieces, alpha, beta,
     mob_mg, mob_eg = _mobility_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                       bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                                       knight_attacks)
-    ks_mg = _king_safety_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+    ks_mg = _king_safety_score(pieces, castling_rights, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
                                 bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
                                 knight_attacks, king_attacks)
     mg += pp_mg + ps_mg + rf_mg + bp_mg + mob_mg + ks_mg
     eg += pp_eg + ps_eg + rf_eg + bp_eg + mob_eg
+    if ENABLE_THREATS:
+        mg += _threats_score(pieces, rook_masks, rook_magics, rook_shifts, rook_offsets, rook_table,
+                              bishop_masks, bishop_magics, bishop_shifts, bishop_offsets, bishop_table,
+                              knight_attacks, king_attacks, pawn_attacks)
     score = (mg * phase_256 + eg * (256 - phase_256)) // 256
-    return score if turn == 0 else -score
+    score = score if turn == 0 else -score
+    if ENABLE_TEMPO:
+        score += TEMPO_BONUS
+    return score
 
 
 def new_eval_state(pieces):
@@ -1180,7 +1541,7 @@ def new_eval_state(pieces):
 def run_perft(fen: str, depth: int) -> int:
     pieces, mailbox, meta = fen_to_state(fen)
     moves_buf_stack = np.zeros((depth + 1, MAX_MOVES), dtype=np.int64)
-    zobrist = np.zeros(1, dtype=np.uint64)  # perft doesn't use the hash/eval; just needs to satisfy make_move's signature
+    zobrist = np.zeros(2, dtype=np.uint64)  # perft doesn't use the hash/eval; just needs to satisfy make_move's signature
     eval_state = new_eval_state(pieces)
     t = _TABLES
     return perft(
@@ -1228,7 +1589,7 @@ def generate_legal_moves_simple(pieces, mailbox, meta):
     )
     color = meta[0]
     legal = []
-    zobrist_scratch = np.zeros(1, dtype=np.uint64)
+    zobrist_scratch = np.zeros(2, dtype=np.uint64)
     eval_scratch = new_eval_state(pieces)
     for i in range(count):
         move = int(moves_buf[i])

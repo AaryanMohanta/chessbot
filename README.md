@@ -11,10 +11,10 @@ violation is caught locally instead of at validation.
 - Python 3.12, full stdlib, and only: `torch==2.13.0+cpu`, `numpy==2.5.2`, `python-chess==1.11.2` (imported as `chess`), `onnxruntime==1.29.0`, `numba==0.67.0`. Nothing else installs at validation; `requirements.txt` in the zip is ignored. Any other import crashes the agent.
 - No native binaries in the zip (no Cython/compiled extensions). `.onnx` / `.safetensors` / `.pt` weight files are fine.
 - The zip goes first on `sys.path` — no shipped file may be named after a module we import (`chess.py`, `random.py`, `types.py`, ...). Hence the `cb_` prefix on every module we add.
-- Runtime: 1 core, 2 GB RAM, no network, no GPU, read-only FS except 256 MB at `/tmp`.
-- Clock: 120 s per side + 0.5 s increment, with a 60 s init budget spent *before* the clock starts.
+- Runtime: 1 core of an AMD EPYC 9V74 @ 2.60 GHz (specified 2026-09; previously just "1 core"), 2 GB RAM, no network, no GPU, read-only FS except 256 MB at `/tmp`.
+- Clock: 120 s per side + 0.5 s increment, with a 90 s init budget spent *before* the clock starts (raised from 60 s, 2026-09 rules update).
 - Output cap: 4096 bytes/move. Malformed output = illegal move = loss.
-- One process per game, alive between moves, keeps its core after `get_move` returns.
+- One process per game, alive between moves, but suspended while the opponent is thinking (2026-09 rules update: pondering is explicitly disabled, not just unimplemented).
 
 See `chessathon-engine-design.md` for the full architecture and the day-by-day
 plan. This repo currently implements days 1-2 of that plan: a correct,
@@ -126,6 +126,44 @@ pytest -m slow tests/test_perft.py
   clock is reserved for final validation runs and the wire-protocol smoke
   test — nobody SPRTs at their competition TC, it's needlessly slow for
   no statistical benefit.
+- **King safety's tuner-fit weights came back negative (2026-09), which
+  is a misspecification signal, not just tuning noise.** King safety is
+  genuinely quadratic in attacker count (two attackers on the king zone
+  is much more than twice as dangerous as one), but the current term is
+  linear (`attacker_weight * KING_ATTACKER_PENALTY_PER_UNIT_MG`, see
+  `_king_safety_score` in `cb_nb_fast.py`), and `quiet-labeled.epd`
+  underrepresents the sharp, king-hunt-heavy positions where that
+  linearity actually breaks. The right fix is a non-linear response
+  curve (a real quadratic or a lookup table indexed by attacker count,
+  the way Stockfish's own king-safety term works) plus retuning against
+  data that better covers those positions. Diagnosed but deliberately
+  **not** rebuilt with under a week left before the deadline — a shipping
+  eval term already validated against real losses is not worth risking
+  on a rework with no time left to properly SPRT/ladder-test it back in
+  if it goes wrong. Parked here for whenever there's runway to do it
+  properly.
+- **A completely won King+Queen(+pawns) vs King(+pawns) endgame can still
+  draw by repetition (2026-09, real ladder loss, round 53).** Root cause:
+  once the search believes it has found a forced mate, several DIFFERENT
+  continuations in a simplified ending like this can each independently
+  score as "mate found" without any of them being the one the search
+  actually commits to and delivers -- there's no explicit mating-
+  technique heuristic (e.g. king-box-in scoring) to break the tie in
+  favour of real, converging progress. Two real, tested mitigations
+  shipped (see `MATE_FOUND_MIN_DEPTH` and the `near_mate_bounds` guard on
+  LMP/LMR in `cb_nb_search.py`): a shallow, possibly-stale mate score no
+  longer stops the iterative-deepening loop early, and late-move pruning/
+  reduction no longer undermine the search while it's actively verifying
+  a suspected mate. Replaying the actual round-53 loss move-by-move
+  through a real, continuously-running engine (real opponent moves, real
+  clock values) confirms these help -- depth is no longer stuck at 1 --
+  but does NOT confirm they fully eliminate the failure mode; the
+  position can still show a stable mate-range score for many consecutive
+  moves without the mate landing. A full fix (real mating-technique
+  scoring, or treating a K+Q(+P) vs K(+P) reduction as a Syzygy-adjacent
+  special case) is a bigger change than is safe to attempt with days left
+  and no time to properly SPRT/ladder-test it back in. Known, partially
+  mitigated, not eliminated.
 
 ## Running the harness
 

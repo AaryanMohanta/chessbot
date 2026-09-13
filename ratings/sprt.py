@@ -31,18 +31,31 @@ sample size scales roughly as 1/(elo1-elo0)^2 — [0, 15] was widened from an
 earlier [0, 10] for exactly that reason: precision we weren't acting on
 was costing real wall-clock time we needed elsewhere.
 
-Concurrency and CPU pinning: each pentanomial pair runs its two games
-sequentially within one thread-pool slot (not simultaneously), so one
-slot only ever has one game's two processes (white+black) alive at a
-time. ``cpu_pin=True`` hard-pins each slot to its own two cores (via
-harness.match.play_game's white_cpu/black_cpu, Linux/taskset only --
-see AgentProcess) instead of letting the OS scheduler place unpinned
-processes freely. That removes the main reason concurrency was kept low:
-unpinned processes (especially numba's LLVM JIT, which can transiently
-use extra threads) were observed to steal cycles from their neighbors
-under high concurrency, which is a test-harness artifact, not real
-engine weakness. Pinned, concurrency can go up to roughly
-(available_cores // 2) without that cross-talk.
+Concurrency and CPU pinning (2026-09, revised): each pentanomial pair
+runs its two games sequentially within one thread-pool slot (not
+simultaneously), so one slot only ever has one game's two processes
+(white+black) alive at a time. ``cpu_pin=True`` hard-pins each slot to
+its own two cores instead of letting the OS scheduler place unpinned
+processes freely -- this removes the main reason concurrency was kept
+low: unpinned processes (especially numba's LLVM JIT, which can
+transiently use extra threads) were observed to steal cycles from their
+neighbors under high concurrency, a test-harness artifact, not real
+engine weakness.
+
+This module previously hard-pinned slots to naive consecutive core
+indices (2*i, 2*i+1) and defaulted concurrency=7 with a comment claiming
+"Linux/taskset only" pinning -- both wrong. harness.match.AgentProcess
+pins on Windows too (via psutil), and naive pairing is actively harmful
+on a hybrid P-core/E-core machine: see ratings/cpu_topology.py's module
+docstring for the full story (this is the exact same bug that was found
+independently in ratings/run_variant_round_robin.py). Both callers now
+share ratings.cpu_topology.PREFERRED_CORE_PAIRS (same-class core pairs
+only, capping safe concurrency at 5 on this dev machine, not the naive
+7) and safe_concurrency(), which additionally caps concurrency against
+*current* free RAM -- concurrent numba/LLVM compiles are memory-hungry
+enough that a correctly-pinned, topology-safe concurrency can still fail
+outright if background apps have eaten most of the machine's RAM, a
+failure mode that's invisible to anything that only looks at cores.
 """
 from __future__ import annotations
 
@@ -56,8 +69,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from harness.match import DEFAULT_INCREMENT_MS, DEFAULT_TIME_MS, play_game  # noqa: E402
+from harness.match import DEFAULT_INCREMENT_MS, DEFAULT_TIME_MS, HARNESS_ARTIFACT_REASONS, play_game  # noqa: E402
 from ratings.book import OPENING_BOOK  # noqa: E402
+from ratings.cpu_topology import PREFERRED_CORE_PAIRS, safe_concurrency  # noqa: E402
+
+MAX_RETRIES_PER_PAIR = 2  # a transient harness crash shouldn't just permanently discard that sample
 
 FAST_TIME_MS = 5_000
 FAST_INCREMENT_MS = 50
@@ -141,14 +157,45 @@ def _play_pair(candidate_path, baseline_path, fen, time_ms, increment_ms, candid
     The pair's two games run sequentially (not concurrently) within
     whichever thread-pool slot called this, so the same two cores
     (``cpu_a``, ``cpu_b``) are reused for both -- one slot, two cores,
-    regardless of which side is which colour in each game."""
+    regardless of which side is which colour in each game.
+
+    Raises RuntimeError if either game's reason is a harness artifact
+    (see harness.match.HARNESS_ARTIFACT_REASONS) -- a compile-budget
+    timeout comes back as an ordinary GameResult, not an exception, so
+    without this check it would silently score as a real loss for
+    whichever side got starved. Found 2026-09 while auditing this
+    function against the same class of bug already fixed in
+    ratings/run_variant_round_robin.py: this path had NO check at all,
+    so every prior SPRT run using pentanomial pairing under any
+    concurrency was vulnerable to exactly this contamination."""
     r1 = play_game(candidate_path, baseline_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=candidate_env, black_env=baseline_env, white_cpu=cpu_a, black_cpu=cpu_b)
+    if r1.reason in HARNESS_ARTIFACT_REASONS:
+        raise RuntimeError(f"harness artifact (game 1): {r1.reason}")
     s1 = {"white": 1.0, "black": 0.0, None: 0.5}[r1.winner]
 
     r2 = play_game(baseline_path, candidate_path, time_ms=time_ms, increment_ms=increment_ms, start_fen=fen, white_env=baseline_env, black_env=candidate_env, white_cpu=cpu_a, black_cpu=cpu_b)
+    if r2.reason in HARNESS_ARTIFACT_REASONS:
+        raise RuntimeError(f"harness artifact (game 2): {r2.reason}")
     s2 = {"black": 1.0, "white": 0.0, None: 0.5}[r2.winner]
 
     return s1 + s2, (r1.reason, r2.reason)
+
+
+def _play_pair_with_retries(candidate_path, baseline_path, fen, time_ms, increment_ms, candidate_env, baseline_env, cpu_a=None, cpu_b=None):
+    """Wraps _play_pair with bounded retries -- a transient harness
+    crash (memory pressure, an unlucky compile under contention)
+    shouldn't just permanently discard that sample. Re-raises the last
+    exception once retries are exhausted, matching _play_pair's own
+    contract so callers don't need to know retries happened."""
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES_PER_PAIR + 2):
+        try:
+            return _play_pair(candidate_path, baseline_path, fen, time_ms, increment_ms, candidate_env, baseline_env, cpu_a, cpu_b)
+        except Exception as exc:
+            last_exc = exc
+            if attempt <= MAX_RETRIES_PER_PAIR:
+                print(f"  RETRY {attempt}/{MAX_RETRIES_PER_PAIR}: pair for opening at {fen[:20]}... after {exc!r}", flush=True)
+    raise last_exc
 
 
 def run_sprt_pentanomial(
@@ -161,7 +208,7 @@ def run_sprt_pentanomial(
     max_pairs: int = 3000,
     time_ms: float = FAST_TIME_MS,
     increment_ms: float = FAST_INCREMENT_MS,
-    concurrency: int = 7,  # this dev box's ceiling: 7 physical cores, see module docstring
+    concurrency: int = 5,  # this dev box's calibrated ceiling; see ratings/cpu_topology.py
     openings: list[tuple[str, str]] | None = None,
     candidate_env: dict | None = None,
     baseline_env: dict | None = None,
@@ -178,14 +225,22 @@ def run_sprt_pentanomial(
     conclude is allowed to finish rather than cancelled, so the final game
     count can overshoot the crossing point by up to concurrency-1 pairs.
 
-    ``cpu_pin``: hard-pin each concurrent slot to its own 2 cores (see
-    module docstring). Needs ``concurrency * 2`` cores to avoid
-    oversubscription -- pass ``False`` (or reduce concurrency) on a
-    smaller box; pinning silently no-ops on non-Linux regardless (see
-    harness.match.AgentProcess).
+    ``cpu_pin``: hard-pin each concurrent slot to its own 2 same-class
+    cores (ratings.cpu_topology.PREFERRED_CORE_PAIRS) instead of naive
+    consecutive indices. ``concurrency`` is re-derived via
+    ratings.cpu_topology.safe_concurrency() regardless of what's passed
+    in, capping it against both this machine's known-safe core pairs and
+    its *current* free RAM (checked fresh every call, since it changes
+    independently of this process) -- pass a lower number to request
+    less, never a way to force more than what's currently safe.
     """
     if openings is None:
         openings = [(oid, fen) for oid, _moves, fen in OPENING_BOOK]
+
+    if cpu_pin:
+        concurrency, cpu_pin = safe_concurrency(concurrency)
+    else:
+        concurrency = max(1, concurrency)
 
     p0, p1 = _elo_to_p(elo0), _elo_to_p(elo1)
     mu0, mu1 = 2 * p0, 2 * p1  # expected *pair* score under each hypothesis
@@ -216,9 +271,9 @@ def run_sprt_pentanomial(
             futures = []
             for i in range(batch):
                 opening_id, fen = openings[(pairs_done + i) % len(openings)]
-                cpu_a, cpu_b = (2 * i, 2 * i + 1) if cpu_pin else (None, None)
+                cpu_a, cpu_b = PREFERRED_CORE_PAIRS[i] if cpu_pin else (None, None)
                 futures.append((opening_id, pool.submit(
-                    _play_pair, candidate_path, baseline_path, fen, time_ms, increment_ms,
+                    _play_pair_with_retries, candidate_path, baseline_path, fen, time_ms, increment_ms,
                     candidate_env, baseline_env, cpu_a, cpu_b,
                 )))
 
@@ -308,15 +363,33 @@ def main() -> int:
     parser.add_argument("--max-pairs", type=int, default=3000)
     parser.add_argument("--time-ms", type=float, default=FAST_TIME_MS)
     parser.add_argument("--increment-ms", type=float, default=FAST_INCREMENT_MS)
-    parser.add_argument("--concurrency", type=int, default=7)
+    parser.add_argument("--concurrency", type=int, default=5)
     parser.add_argument("--no-cpu-pin", action="store_true", help="disable core pinning (use on a small box, or where concurrency*2 exceeds available cores)")
     parser.add_argument("--simple", action="store_true", help="use the older per-game Bernoulli SPRT instead of pentanomial pairing")
+    parser.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE",
+                         help="env var to set for the candidate process only (repeatable) -- lets "
+                              "candidate_path and baseline_path be the SAME agent.py isolating one "
+                              "flag, e.g. --candidate-env CB_NB_ENABLE_CORRHIST=1")
+    parser.add_argument("--baseline-env", action="append", default=[], metavar="KEY=VALUE",
+                         help="env var to set for the baseline process only (repeatable)")
     args = parser.parse_args()
 
+    def _parse_env(pairs: list[str]) -> dict:
+        env = {}
+        for pair in pairs:
+            key, _, value = pair.partition("=")
+            if not _:
+                raise SystemExit(f"--candidate-env/--baseline-env expects KEY=VALUE, got: {pair!r}")
+            env[key] = value
+        return env
+
+    candidate_env = _parse_env(args.candidate_env)
+    baseline_env = _parse_env(args.baseline_env)
+
     if args.simple:
-        outcome = run_sprt(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_games=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms)
+        outcome = run_sprt(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_games=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms, candidate_env=candidate_env, baseline_env=baseline_env)
     else:
-        outcome = run_sprt_pentanomial(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_pairs=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms, concurrency=args.concurrency, cpu_pin=not args.no_cpu_pin)
+        outcome = run_sprt_pentanomial(args.candidate_path, args.baseline_path, args.elo0, args.elo1, alpha=args.alpha, beta=args.beta, max_pairs=args.max_pairs, time_ms=args.time_ms, increment_ms=args.increment_ms, concurrency=args.concurrency, cpu_pin=not args.no_cpu_pin, candidate_env=candidate_env, baseline_env=baseline_env)
 
     print()
     print(f"DECISION: {outcome['decision']} - {outcome['reason']} after {outcome['games']} games (LLR={outcome['llr']:+.3f})")

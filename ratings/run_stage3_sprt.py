@@ -12,7 +12,7 @@ wall-clock cost of each game.
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(r"C:\Users\m_bha\chessbot")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from ratings.sprt import run_sprt

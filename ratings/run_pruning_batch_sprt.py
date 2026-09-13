@@ -32,7 +32,12 @@ AGENT = str(REPO_ROOT / "cb_nb_agent.py")
 TIME_MS = 5_000
 INCREMENT_MS = 50
 ELO0, ELO1 = 0.0, 15.0
-MAX_PAIRS = 4000
+# 4000 is the "run it overnight" cap. Optional CLI override for a
+# time-boxed run before a deadline, e.g. `python run_pruning_batch_sprt.py
+# 250` -- SPRT still resolves early on a clear effect either way; a lower
+# cap only risks an "inconclusive" outcome if the true effect sits near
+# the elo0/elo1 boundary, it doesn't bias the result.
+MAX_PAIRS = int(sys.argv[1]) if len(sys.argv) > 1 else 4000
 CONCURRENCY = 7
 
 PRUNING_ON = {"CB_NB_ENABLE_RFP": "1", "CB_NB_ENABLE_FUTILITY": "1", "CB_NB_ENABLE_LMP": "1"}

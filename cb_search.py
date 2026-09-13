@@ -295,7 +295,6 @@ def search(
     hard_ms: float,
     tt: TranspositionTable,
     generation: int = 0,
-    stop_check=lambda: False,
 ) -> tuple[chess.Move, int, SearchInfo]:
     """Iterative deepening from depth 1, returning the best move from the
     last *completed* iteration (design doc §5, §7).
@@ -311,8 +310,6 @@ def search(
             game, not just within this one search() call.
         generation: search generation for the TT's replacement policy;
             the caller bumps this once per move.
-        stop_check: reserved for an external abort signal (e.g. pondering
-            being told to stand down); not used by the ID loop directly.
     """
     legal_moves = list(board.legal_moves)
     if not legal_moves:
@@ -329,8 +326,6 @@ def search(
 
     depth = 1
     while depth <= MAX_DEPTH:
-        if stop_check():
-            break
         try:
             score, move = searcher.root_search(board, depth)
         except _SearchTimeout:

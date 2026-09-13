@@ -31,8 +31,11 @@ from __future__ import annotations
 import dataclasses
 
 # One-time budget for process start + engine init (weight loading, warmup),
-# spent before the per-move clock begins. Not consumed by budget().
-INIT_BUDGET_MS = 60_000
+# spent before the per-move clock begins. Not consumed by budget(). Raised
+# 60_000 -> 90_000 (2026-09) per the competition rules update; real ladder
+# hardware compiles in ~28-33s either way, so this mainly widens the
+# margin before a legitimate compile is ever mistaken for a hang.
+INIT_BUDGET_MS = 90_000
 
 DEFAULT_INCREMENT_MS = 500
 
@@ -48,6 +51,24 @@ MIN_MOVES_TO_GO = 15
 MOVES_TO_GO_BASE = 50
 HARD_SOFT_MULTIPLE = 4
 HARD_FRACTION_OF_USABLE = 0.3
+
+# 600-ply-draw retest (2026-09): moves_to_go's floor of 15 was tuned
+# against 47-move real games, not the new rule's 300-move-per-side cap.
+# Simulating an always-spend-soft 300-of-our-own-moves game shows this
+# does NOT actually flag -- moves_to_go staying fixed at 15 forever past
+# ply 70 makes usable_ms geometrically decay toward a stable equilibrium
+# (~1.5x increment) rather than bleeding to zero, since the increment
+# keeps replenishing it every move. But hard_ms converges to well under
+# the increment itself (~0.3x the equilibrium usable, i.e. ~45% of one
+# increment) for the entire rest of a long endgame -- exactly the phase
+# where actually converting or defending a drawn-out position matters
+# most, and now that a 600-ply draw is a real half-point instead of a
+# material-based loss, that's worth protecting. Flooring hard_ms at the
+# increment itself (see budget() below) is always sustainable regardless
+# of how long the game runs: RESERVE_MS is already carved out of
+# usable_ms before any of this math happens, so spending up to one full
+# increment per move can never be the thing that actually empties the
+# real clock.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,5 +102,17 @@ class TimeManager:
 
         soft_ms = increment_ms * 0.9 + usable_ms / moves_to_go
         hard_ms = min(soft_ms * HARD_SOFT_MULTIPLE, usable_ms * HARD_FRACTION_OF_USABLE)
+        # Floor (2026-09, see the comment above MIN_MOVES_TO_GO) -- only
+        # once moves_to_go has hit its floor, i.e. only in the long-game
+        # regime this is actually targeting: an early-game move that's
+        # genuinely short on time (moves_to_go still large) must NOT get
+        # this floor, or it starts spending a much bigger share of a
+        # tiny usable_ms than the formula intends (see
+        # test_soft_can_exceed_hard_when_time_is_low, which depends on
+        # exactly that regime staying untouched). Capped by usable_ms
+        # itself so this can never claim more than what's actually
+        # banked regardless.
+        if moves_to_go == MIN_MOVES_TO_GO:
+            hard_ms = max(hard_ms, min(increment_ms, usable_ms))
 
         return TimeBudget(soft_ms=int(soft_ms), hard_ms=int(hard_ms))

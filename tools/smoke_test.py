@@ -1,6 +1,6 @@
 """Replicates the validation harness's smoke checks:
 
-  1. Fresh import + init well under the 60 s init budget.
+  1. Fresh import + init well under the 90 s init budget.
   2. One full game as each colour against a baseline opponent.
   3. Every move returned was legal (a crash or illegal move ends the game
      as a loss for that side — this test asserts that never happens to us,
@@ -37,17 +37,32 @@ OUR_LOSS_REASONS_ARE_BUGS = (
 
 
 def check_init_time() -> bool:
+    """Checks the init budget itself, AND (2026-09, after a real ladder
+    loss -- round 52 -- where this went unnoticed) that the numba engine
+    actually compiled rather than silently falling back to v1: a v1
+    fallback never crashes and always returns legal moves, so the two
+    game checks below would have passed clean the entire time this bug
+    was live, with nothing to distinguish "numba played" from "v1 played
+    the whole game" short of reading the raw stderr by hand."""
     print("== init time ==")
     proc = AgentProcess(AGENT_PATH, "agent")
     try:
         proc.wait_ready()
     finally:
+        stderr_tail = proc._drain_stderr(max_chars=4000)
         proc.close()
 
     ok = proc.init_ms is not None and proc.init_ms < INIT_BUDGET_MS
     print(f"  init took {proc.init_ms:.1f} ms (budget {INIT_BUDGET_MS} ms) -> {'PASS' if ok else 'FAIL'}")
     if proc.init_ms is not None and proc.init_ms > INIT_BUDGET_MS * 0.8:
         print("  WARNING: close to the init budget")
+
+    if "compile failed" in stderr_tail:
+        ok = False
+        print("  FAIL: numba engine failed to compile -- silently falls back to v1 for the whole game.")
+        print("  stderr:")
+        for line in stderr_tail.splitlines():
+            print(f"    {line}")
     return ok
 
 
